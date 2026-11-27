@@ -685,7 +685,7 @@ function Get-ModelParts([string]$m) {
 }
 
 # ---------- 版本 / 更新检查 / 低额度提醒 ----------
-$script:Version    = '1.3.1'
+$script:Version    = '1.3.2'
 $script:UpdateNote = ''
 $script:UpdateAt   = [DateTime]::MinValue
 $script:AlertLevel = ''
@@ -706,10 +706,20 @@ function Get-TextSha1([string]$text) {
 function Test-RemoteUpdate {
     if (((Get-Date) - $script:UpdateAt).TotalHours -lt 1) { return }
     $script:UpdateAt = Get-Date
+    $urls = @(
+        'https://cdn.jsdelivr.net/gh/GitHubBsss/doubao-quota-widget@main/version.json',
+        'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/version.json'
+    )
     try {
-        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/version.json' -UseBasicParsing -TimeoutSec 8
-        $v = $raw.Content | ConvertFrom-Json
-        $remote = [string]$v.version
+        $remote = ''
+        foreach ($u in $urls) {
+            try {
+                $raw = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 8
+                $v = $raw.Content | ConvertFrom-Json
+                $remote = [string]$v.version
+                if ($remote) { break }
+            } catch { }
+        }
         if ($remote -and ([version]$remote -gt [version]$script:Version)) {
             if ($script:UpdateNote -ne ('新版 ' + $remote)) { Write-Log ('update available: ' + $remote) }
             $script:UpdateNote = '新版 ' + $remote
