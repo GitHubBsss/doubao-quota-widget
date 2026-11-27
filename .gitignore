@@ -10,6 +10,12 @@ daemon.log
 err.log
 out.log
 daemon.lock
+daemon.pause
+command.txt
+daily-usage.json
+quota-history.csv
+dashboard.html
+weekly-report.md
 
 # 截图与临时产物
 *.png

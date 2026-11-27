@@ -9,10 +9,15 @@ $here        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $widgetF     = Join-Path $here 'widget.js'
 $dataF       = Join-Path $here 'data.json'
 $historyF    = Join-Path $here 'quota-history.json'
+$dailyF      = Join-Path $here 'daily-usage.json'
 $csvF        = Join-Path $here 'quota-history.csv'
 $logF        = Join-Path $here 'daemon.log'
 $lockF       = Join-Path $here 'daemon.lock'
 $posF        = Join-Path $here 'widget-pos.json'
+$pauseF      = Join-Path $here 'daemon.pause'
+$cmdF        = Join-Path $here 'command.txt'
+$dashF       = Join-Path $here 'dashboard.html'
+$reportF     = Join-Path $here 'weekly-report.md'
 $CdpList     = 'http://127.0.0.1:9222/json/list'
 $PollMs      = 2500
 $QuotaSec    = 30      # 额度刷新间隔（秒）
@@ -92,6 +97,7 @@ function Eval-InPage($ws, [string]$expr, [bool]$await = $false) {
 $script:Aid = ''
 $script:Scale = 1.0
 $script:AlertPct = 20
+$script:ConfigQuiet = ''
 $cfgF = Join-Path $here 'config.json'
 if (Test-Path -LiteralPath $cfgF) {
     try {
@@ -99,6 +105,7 @@ if (Test-Path -LiteralPath $cfgF) {
         if ($cfg.aid) { $script:Aid = [string]$cfg.aid }
         if ($null -ne $cfg.scale) { $script:Scale = [double]$cfg.scale }
         if ($null -ne $cfg.alert_pct) { $script:AlertPct = [double]$cfg.alert_pct }
+        if ($cfg.quiet_hours) { $script:ConfigQuiet = [string]$cfg.quiet_hours }
     } catch { }
 }
 if (-not $script:Aid -and $env:DOUBAO_AID) { $script:Aid = [string]$env:DOUBAO_AID }
@@ -263,6 +270,7 @@ function Add-Sample([double]$used, [double]$remain) {
         $json = @($script:History) | ConvertTo-Json -Compress -Depth 4
         [IO.File]::WriteAllText($historyF, $json, (New-Object Text.UTF8Encoding($false)))
     } catch { }
+    Add-DailyDelta $used
 }
 
 function Get-TodayTrend {
@@ -312,34 +320,136 @@ function Get-TodayTrend {
 }
 
 # ---------- 近 7 天每日消耗（按本地自然日切分，只累计正向增量） ----------
-function Get-WeekBuckets {
+function Get-DailyBuckets([int]$Days = 7) {
     $today = (Get-Date).Date
     $out = @()
-    for ($i = 6; $i -ge 0; $i--) {
+    for ($i = $Days - 1; $i -ge 0; $i--) {
         $day = $today.AddDays(-$i)
         $startMs = ([DateTimeOffset]$day).ToUnixTimeMilliseconds()
         $endMs   = ([DateTimeOffset]$day.AddDays(1)).ToUnixTimeMilliseconds()
 
-        $prev = $null
-        foreach ($s in $script:History) {
-            if ([int64]$s.t -lt [int64]$startMs) { $prev = [double]$s.u } else { break }
-        }
-
+        $key = $day.ToString('yyyy-MM-dd')
         $sum = 0.0
-        foreach ($s in $script:History) {
-            $t = [int64]$s.t
-            if ($t -lt $startMs) { continue }
-            if ($t -ge $endMs) { break }
-            $u = [double]$s.u
-            if ($null -eq $prev) { $prev = $u }
-            $d = $u - $prev
-            if ($d -gt 0) { $sum += $d }
-            $prev = $u
+        if ($script:Daily -and $script:Daily.ContainsKey($key)) {
+            # 长期口径：用每日累计（历史采样只保留 24 小时）
+            $sum = [double]$script:Daily[$key]
+        } else {
+            $prev = $null
+            foreach ($s in $script:History) {
+                if ([int64]$s.t -lt [int64]$startMs) { $prev = [double]$s.u } else { break }
+            }
+            foreach ($s in $script:History) {
+                $t = [int64]$s.t
+                if ($t -lt $startMs) { continue }
+                if ($t -ge $endMs) { break }
+                $u = [double]$s.u
+                if ($null -eq $prev) { $prev = $u }
+                $d = $u - $prev
+                if ($d -gt 0) { $sum += $d }
+                $prev = $u
+            }
         }
 
         $out += [pscustomobject]@{ d = $day.ToString('MM-dd'); v = [int][math]::Round($sum) }
     }
     return $out
+}
+
+# ---------- 每日累计（跨重启保留，供 7/30 天统计与报表） ----------
+$script:Daily = @{}
+$script:DailyLast = $null
+if (Test-Path -LiteralPath $dailyF) {
+    try {
+        $o = Get-Content -LiteralPath $dailyF -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($o.days) {
+            foreach ($p in $o.days.PSObject.Properties) { $script:Daily[$p.Name] = [double]$p.Value }
+        }
+        if ($null -ne $o.last) { $script:DailyLast = [double]$o.last }
+    } catch { }
+}
+
+function Save-Daily {
+    try {
+        $obj = @{ days = $script:Daily; last = $script:DailyLast }
+        [IO.File]::WriteAllText($dailyF, ($obj | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Add-DailyDelta([double]$used) {
+    $day = (Get-Date).ToString('yyyy-MM-dd')
+    if ($null -ne $script:DailyLast) {
+        $d = $used - [double]$script:DailyLast
+        if ($d -gt 0) {
+            if (-not $script:Daily.ContainsKey($day)) { $script:Daily[$day] = 0.0 }
+            $script:Daily[$day] = [double]$script:Daily[$day] + $d
+        }
+    }
+    $script:DailyLast = $used
+    Save-Daily
+}
+
+function Initialize-Daily {
+    $day = (Get-Date).ToString('yyyy-MM-dd')
+    if ($null -eq $script:DailyLast -and $script:History.Count -gt 0) {
+        $script:DailyLast = [double]$script:History[$script:History.Count - 1].u
+    }
+    if (-not $script:Daily.ContainsKey($day)) {
+        # 首跑时用今天的历史采样回算，避免当天消耗显示为 0
+        $firstU = $null
+        $lastU = $null
+        foreach ($s in $script:History) {
+            $d = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.t).ToLocalTime().ToString('yyyy-MM-dd')
+            if ($d -eq $day) {
+                if ($null -eq $firstU) { $firstU = [double]$s.u }
+                $lastU = [double]$s.u
+            }
+        }
+        $seed = 0.0
+        if ($null -ne $firstU -and $null -ne $lastU -and $lastU -gt $firstU) { $seed = $lastU - $firstU }
+        $script:Daily[$day] = $seed
+        $script:Consumed = $seed
+        Save-Daily
+    }
+}
+
+function Get-UsageStats {
+    $d30 = @(Get-DailyBuckets 30)
+    $d7  = @(Get-DailyBuckets 7)
+
+    $t30 = 0.0; foreach ($x in $d30) { $t30 += [double]$x.v }
+    $t7  = 0.0; foreach ($x in $d7)  { $t7  += [double]$x.v }
+
+    $active = @($script:Daily.Keys | Where-Object { $_ -ge (Get-Date).AddDays(-30).ToString('yyyy-MM-dd') }).Count
+    $avg = if ($active -gt 0) { $t30 / $active } else { 0 }
+
+    $peak = $d30 | Sort-Object v -Descending | Select-Object -First 1
+
+    # 近 24 小时按小时分布（判断自己什么时候最费额度）
+    $hours = New-Object int[] 24
+    $prev = $null; $prevDay = ''
+    foreach ($s in $script:History) {
+        $dt = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.t).ToLocalTime()
+        $day = $dt.ToString('yyyy-MM-dd')
+        if ($day -ne $prevDay) { $prev = [double]$s.u; $prevDay = $day }
+        else {
+            $delta = [double]$s.u - [double]$prev
+            if ($delta -gt 0) { $hours[$dt.Hour] += [int]$delta }
+            $prev = [double]$s.u
+        }
+    }
+    $busy = 0
+    for ($i = 1; $i -lt 24; $i++) { if ($hours[$i] -gt $hours[$busy]) { $busy = $i } }
+
+    return [pscustomobject]@{
+        Week7    = [int][math]::Round($t7)
+        Total30  = [int][math]::Round($t30)
+        Avg30    = [double]$avg
+        PeakDay  = if ($peak) { $peak.d } else { '' }
+        PeakVal  = if ($peak) { [int]$peak.v } else { 0 }
+        BusyHour = $busy
+        Hours    = @($hours)
+        Days30   = @($d30)
+    }
 }
 
 # ---------- 导出 CSV（Excel 可直接打开：时间 / 已用 / 剩余 / 当日累计） ----------
@@ -487,12 +597,17 @@ function Get-ModelParts([string]$m) {
 }
 
 # ---------- 版本 / 更新检查 / 低额度提醒 ----------
-$script:Version    = '1.1.0'
+$script:Version    = '1.2.0'
 $script:UpdateNote = ''
 $script:UpdateAt   = [DateTime]::MinValue
 $script:AlertLevel = ''
 $script:AlertDate  = ''
 $script:Week       = @()
+$script:Stats      = $null
+$script:Paused     = Test-Path -LiteralPath $pauseF
+$script:WantQuit   = $false
+$script:Quiet      = $script:ConfigQuiet
+$script:CmdStamp   = [long]0
 
 function Get-TextSha1([string]$text) {
     $sha = [System.Security.Cryptography.SHA1]::Create()
@@ -504,13 +619,15 @@ function Test-RemoteUpdate {
     if (((Get-Date) - $script:UpdateAt).TotalHours -lt 1) { return }
     $script:UpdateAt = Get-Date
     try {
-        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/widget.js' -UseBasicParsing -TimeoutSec 8
-        $local = [IO.File]::ReadAllText($widgetF)
-        if ((Get-TextSha1 $raw.Content) -ne (Get-TextSha1 $local)) {
-            if ($script:UpdateNote -ne '有新版') { Write-Log 'update available (remote widget.js differs)' }
-            $script:UpdateNote = '有新版'
-        } else {
-            $script:UpdateNote = ''
+        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/doubao-widget-daemon.ps1' -UseBasicParsing -TimeoutSec 8
+        if ($raw.Content -match "Version\s*=\s*'([0-9.]+)'") {
+            $remote = $Matches[1]
+            if ([version]$remote -gt [version]$script:Version) {
+                if ($script:UpdateNote -ne ('新版 ' + $remote)) { Write-Log ('update available: ' + $remote) }
+                $script:UpdateNote = '新版 ' + $remote
+            } else {
+                $script:UpdateNote = ''
+            }
         }
     } catch {
         # 离线/限流时静默，下一次再试
@@ -532,6 +649,47 @@ function Show-AlertBalloon([string]$text) {
     } catch { }
 }
 
+# 静默时段，如 "22:00-08:00"
+function Test-QuietHours {
+    if (-not $script:Quiet) { return $false }
+    try {
+        if ($script:Quiet -notmatch '^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$') { return $false }
+        $sh = [int]$Matches[1]; $sm = [int]$Matches[2]; $eh = [int]$Matches[3]; $em = [int]$Matches[4]
+        $now = (Get-Date).TimeOfDay
+        $s = New-Object TimeSpan $sh, $sm, 0
+        $e = New-Object TimeSpan $eh, $em, 0
+        if ($s -lt $e) { return ($now -ge $s -and $now -lt $e) }
+        return ($now -ge $s -or $now -lt $e)
+    } catch { return $false }
+}
+
+function XmlEsc([string]$s) {
+    return ($s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;')
+}
+
+# 原生 Toast（失败退回托盘气泡）
+function Show-Toast([string]$title, [string]$text) {
+    if (Test-QuietHours) { Write-Log 'toast skipped (quiet hours)'; return }
+    try {
+        $aumid = 'Doubao.QuotaWidget'
+        $key = "HKCU:\Software\Classes\AppUserModelId\$aumid"
+        if (-not (Test-Path -LiteralPath $key)) {
+            New-Item -Path $key -Force | Out-Null
+            New-ItemProperty -Path $key -Name DisplayName -Value '豆包额度' -PropertyType String -Force | Out-Null
+        }
+        [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>' + (XmlEsc $title) + '</text><text>' + (XmlEsc $text) + '</text></binding></visual></toast>')
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($aumid).Show($toast)
+        Write-Log 'toast shown'
+    } catch {
+        Write-Log ('toast failed: ' + $_.Exception.Message)
+        Show-AlertBalloon $text
+    }
+}
+
 function Update-Alert($m) {
     $pct = [double]$m.RemainPct
     $text = ''
@@ -547,7 +705,7 @@ function Update-Alert($m) {
     $today = (Get-Date).ToString('yyyy-MM-dd')
     if ($level -and ($script:AlertLevel -ne $level -or $script:AlertDate -ne $today)) {
         Write-Log ('alert -> ' + $level + ' ' + $text)
-        Show-AlertBalloon $text
+        Show-Toast '豆包额度提醒' $text
     }
     $script:AlertLevel = $level
     $script:AlertDate  = $today
@@ -575,6 +733,10 @@ function New-DataJson {
     $null = $rows.Add(@('可用额度', $m.RemainStr))
     $null = $rows.Add(@('已用 / 总额', ('{0:0} / {1:0} · {2}%' -f $m.Used, $m.Total, $m.Pct)))
     $null = $rows.Add(@('今日新增消耗', ('+{0:0}' -f $script:Consumed)))
+    if ($script:Stats) {
+        $null = $rows.Add(@('本周消耗', ('{0} 点' -f $script:Stats.Week7)))
+        $null = $rows.Add(@('近 30 天日均', ('{0:0.0} 点/天' -f $script:Stats.Avg30)))
+    }
     $null = $rows.Add(@('消耗速度', $rateText))
     $null = $rows.Add(@('预计用完', $etaText))
     foreach ($w in @($m.Windows)) {
@@ -605,6 +767,8 @@ function New-DataJson {
         trend   = @($script:Trend)
         week    = @($script:Week)
         alert   = (Update-Alert $m)
+        paused  = [bool]$script:Paused
+        ver     = [string]$script:Version
         openUrl = $OpenUrl
         scale   = [double]$script:Scale
         gauge   = @{ center = $centerText; rings = $gaugeRings }
@@ -616,10 +780,187 @@ function New-DataJson {
     return ($data | ConvertTo-Json -Depth 6 -Compress)
 }
 
+# ---------- 用量报表（HTML + Markdown 周报） ----------
+function New-Dashboard {
+    $st = Get-UsageStats
+    $m  = $script:Metrics
+
+    $maxD = 1.0
+    foreach ($x in $st.Days30) { if ([double]$x.v -gt $maxD) { $maxD = [double]$x.v } }
+
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.AppendLine('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">')
+    $null = $sb.AppendLine('<title>豆包额度用量报表</title><style>')
+    $null = $sb.AppendLine('body{margin:0;padding:28px 32px;background:#17181b;color:#e8e8ea;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}')
+    $null = $sb.AppendLine('h1{font-size:20px;margin:0 0 4px}.sub{color:#8b8b94;font-size:12px;margin-bottom:22px}')
+    $null = $sb.AppendLine('.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:26px}')
+    $null = $sb.AppendLine('.card{flex:1;min-width:150px;background:#1f2023;border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:14px 16px}')
+    $null = $sb.AppendLine('.card .k{color:#9a9aa2;font-size:12px}.card .v{font-size:22px;font-weight:600;margin-top:6px;color:#f5c451}')
+    $null = $sb.AppendLine('.sec{margin-bottom:26px}.sec h2{font-size:14px;margin:0 0 12px;color:#c9c9cf}')
+    $null = $sb.AppendLine('.bars{display:flex;align-items:flex-end;gap:4px;height:130px;background:#1f2023;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:12px}')
+    $null = $sb.AppendLine('.b{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px}')
+    $null = $sb.AppendLine('.b .bar{width:100%;background:#f5c451;border-radius:3px;opacity:.85}.b .d{font-size:10px;color:#8b8b94}.b .v{font-size:9px;color:#9a9aa2}')
+    $null = $sb.AppendLine('.hb{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:3px}')
+    $null = $sb.AppendLine('.hb .bar{width:100%;background:#7fd8ff;border-radius:2px;opacity:.8}.hb .d{font-size:9px;color:#8b8b94}')
+    $null = $sb.AppendLine('table{border-collapse:collapse;width:100%;font-size:12px}td,th{padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}th{color:#9a9aa2;font-weight:500}')
+    $null = $sb.AppendLine('</style></head><body>')
+
+    $null = $sb.AppendLine('<h1>豆包额度用量报表</h1>')
+    $null = $sb.AppendLine('<div class="sub">生成时间 ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' · 数据来源：本机 30 秒采样</div>')
+
+    $null = $sb.AppendLine('<div class="cards">')
+    $cards = @(
+        @('可用额度', $(if ($m) { $m.RemainStr } else { '—' })),
+        @('已用 / 总额', $(if ($m) { ('{0:0} / {1:0} · {2}%' -f $m.Used, $m.Total, $m.Pct) } else { '—' })),
+        @('今日消耗', ('+{0:0}' -f $script:Consumed)),
+        @('本周消耗', ('{0} 点' -f $st.Week7)),
+        @('近 30 天日均', ('{0:0.0} 点/天' -f $st.Avg30)),
+        @('最费时段', ('{0:00}:00 前后' -f $st.BusyHour))
+    )
+    foreach ($c in $cards) {
+        $null = $sb.AppendLine('<div class="card"><div class="k">' + $c[0] + '</div><div class="v">' + (XmlEsc ([string]$c[1])) + '</div></div>')
+    }
+    $null = $sb.AppendLine('</div>')
+
+    $null = $sb.AppendLine('<div class="sec"><h2>近 30 天每日消耗</h2><div class="bars">')
+    foreach ($x in $st.Days30) {
+        $h = [int][math]::Max(2, [math]::Round(90 * ([double]$x.v / $maxD)))
+        $null = $sb.AppendLine('<div class="b"><span class="v">' + $x.v + '</span><div class="bar" style="height:' + $h + 'px"></div><span class="d">' + $x.d + '</span></div>')
+    }
+    $null = $sb.AppendLine('</div></div>')
+
+    $maxH = 1
+    foreach ($v in $st.Hours) { if ($v -gt $maxH) { $maxH = $v } }
+    $null = $sb.AppendLine('<div class="sec"><h2>近 24 小时时段分布</h2><div class="bars" style="height:110px">')
+    for ($i = 0; $i -lt 24; $i++) {
+        $h = [int][math]::Max(2, [math]::Round(70 * ([double]$st.Hours[$i] / $maxH)))
+        $op = if ($i -eq $st.BusyHour) { '1' } else { '.7' }
+        $null = $sb.AppendLine('<div class="hb"><div class="bar" style="height:' + $h + 'px;opacity:' + $op + '"></div><span class="d">' + $i + '</span></div>')
+    }
+    $null = $sb.AppendLine('</div></div>')
+
+    $null = $sb.AppendLine('<div class="sec"><h2>概览</h2><table><tr><th>项目</th><th>数值</th></tr>')
+    $rows = @(
+        @('峰值日', ($(if ($st.PeakDay) { $st.PeakDay + ' · ' + $st.PeakVal + ' 点' } else { '—' }) )),
+        @('消耗速度', $(if ($script:LastRate -gt 0) { ('{0:0.0} 点/小时' -f $script:LastRate) } else { '—' })),
+        @('预计用完', $(if ($script:LastRate -gt 0 -and $m -and $m.RemainNum -gt 0) { Format-Duration ($m.RemainNum / $script:LastRate) } else { '—' })),
+        @('数据窗口', '近 30 天（30 秒采样，历史明细保留 24 小时）')
+    )
+    foreach ($r in $rows) {
+        $null = $sb.AppendLine('<tr><td>' + $r[0] + '</td><td>' + (XmlEsc ([string]$r[1])) + '</td></tr>')
+    }
+    $null = $sb.AppendLine('</table></div></body></html>')
+
+    [IO.File]::WriteAllText($dashF, $sb.ToString(), (New-Object Text.UTF8Encoding($true)))
+
+    # Markdown 周报
+    $md = New-Object System.Text.StringBuilder
+    $null = $md.AppendLine('# 豆包额度周报 · ' + (Get-Date -Format 'yyyy-MM-dd'))
+    $null = $md.AppendLine('')
+    $null = $md.AppendLine('- 本周消耗：' + $st.Week7 + ' 点')
+    $null = $md.AppendLine('- 近 30 天日均：' + ('{0:0.0}' -f $st.Avg30) + ' 点/天')
+    $null = $md.AppendLine('- 峰值日：' + $(if ($st.PeakDay) { $st.PeakDay + '（' + $st.PeakVal + ' 点）' } else { '—' }))
+    $null = $md.AppendLine('- 最费时段：' + ('{0:00}:00' -f $st.BusyHour) + ' 前后')
+    $null = $md.AppendLine('- 当前速度：' + $(if ($script:LastRate -gt 0) { ('{0:0.0} 点/小时' -f $script:LastRate) } else { '—' }))
+    $null = $md.AppendLine('- 预计用完：' + $(if ($script:LastRate -gt 0 -and $m -and $m.RemainNum -gt 0) { Format-Duration ($m.RemainNum / $script:LastRate) } else { '—' }))
+    $null = $md.AppendLine('')
+    $null = $md.AppendLine('## 每日明细')
+    $null = $md.AppendLine('')
+    $null = $md.AppendLine('| 日期 | 消耗（点） |')
+    $null = $md.AppendLine('| --- | --- |')
+    foreach ($x in $st.Days30) { $null = $md.AppendLine('| ' + $x.d + ' | ' + $x.v + ' |') }
+    [IO.File]::WriteAllText($reportF, $md.ToString(), (New-Object Text.UTF8Encoding($true)))
+
+    return $dashF
+}
+
+# ---------- 命令处理（右键菜单 / 命令行 / command.txt） ----------
+function Invoke-DaemonCmd([string]$action) {
+    switch ($action.Trim().ToLower()) {
+        'refresh' {
+            $script:DataAt = [DateTime]::MinValue
+            Write-Log 'cmd -> refresh'
+        }
+        'pause' {
+            Set-Content -LiteralPath $pauseF -Value '1' -Encoding ascii
+            $script:Paused = $true
+            Write-Log 'cmd -> pause'
+        }
+        'resume' {
+            Remove-Item -LiteralPath $pauseF -Force -ErrorAction SilentlyContinue
+            $script:Paused = $false
+            $script:DataAt = [DateTime]::MinValue
+            Write-Log 'cmd -> resume'
+        }
+        'export' {
+            Export-HistoryCsv
+            Write-Log 'cmd -> export'
+            Show-Toast '豆包额度' '用量已导出到 quota-history.csv'
+        }
+        'report' {
+            $f = New-Dashboard
+            Start-Process -FilePath $f
+            Write-Log ('cmd -> report ' + $f)
+        }
+        'open' {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList $here
+            Write-Log 'cmd -> open folder'
+        }
+        'update' {
+            $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $up = Join-Path $here 'widget.ps1'
+            if (Test-Path -LiteralPath $up) {
+                Start-Process -FilePath $ps -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $up, 'update' -WindowStyle Hidden
+                Write-Log 'cmd -> update'
+                $script:WantQuit = $true
+            }
+        }
+        'quit' {
+            Write-Log 'cmd -> quit'
+            $script:WantQuit = $true
+        }
+        default { Write-Log ('cmd -> unknown: ' + $action) }
+    }
+
+    # 暂停/恢复等状态变化后，让挂件立刻同步
+    if ($script:Metrics -and -not $script:WantQuit) {
+        try {
+            $nj = New-DataJson
+            if ($nj -and $nj -ne $script:DataJson) {
+                $script:DataJson = $nj
+                [IO.File]::WriteAllText($dataF, ($nj | ConvertFrom-Json | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+            }
+        } catch { }
+    }
+}
+
 # ---------- 主循环 ----------
 Write-Log "daemon start (pid=$PID)"
+Initialize-Daily
+$script:Stats = Get-UsageStats
 
 while ($true) {
+    # 命令行 / 外部脚本投递的命令
+    try {
+        if (Test-Path -LiteralPath $cmdF) {
+            $cmd = (Get-Content -LiteralPath $cmdF -Raw -ErrorAction SilentlyContinue).Trim()
+            Remove-Item -LiteralPath $cmdF -Force -ErrorAction SilentlyContinue
+            if ($cmd) { Invoke-DaemonCmd $cmd }
+        }
+    } catch { }
+
+    if ($script:WantQuit) { break }
+
+    # widget.js 运行中被修改也要生效
+    try {
+        $h = Get-TextSha1([IO.File]::ReadAllText($widgetF))
+        if ($h -ne $script:WidgetHash) {
+            $script:WidgetHash = $h
+            $script:ForceRebuild = $true
+            Write-Log 'widget.js changed -> rebuild'
+        }
+    } catch { }
+
     $list = $null
     try {
         $raw = Invoke-WebRequest -Uri $CdpList -UseBasicParsing -TimeoutSec 3
@@ -635,7 +976,7 @@ while ($true) {
     }
 
     # ---- 刷新额度 ----
-    if (((Get-Date) - $script:DataAt).TotalSeconds -ge $QuotaSec) {
+    if (-not $script:Paused -and ((Get-Date) - $script:DataAt).TotalSeconds -ge $QuotaSec) {
         try {
             $m = Get-QuotaMetrics $list
             Add-Sample $m.Used $m.RemainNum
@@ -645,7 +986,8 @@ while ($true) {
             $script:Metrics  = $m
             $script:Trend    = @($tr.Points)
             $script:Consumed = $tr.Consumed
-            $script:Week     = @(Get-WeekBuckets)
+            $script:Week     = @(Get-DailyBuckets 7)
+            $script:Stats    = Get-UsageStats
             Export-HistoryCsv
 
             $json = New-DataJson
@@ -742,6 +1084,18 @@ while ($true) {
                 }
             } catch { }
 
+            # 右键菜单 / 页面内投递的命令
+            try {
+                $cres = Eval-InPage $ws "window.__dbxCmd ? JSON.stringify(window.__dbxCmd) : ''"
+                $ctxt = ''
+                if ($cres.result -and $cres.result.result) { $ctxt = [string]$cres.result.result.value }
+                if ($ctxt) {
+                    $null = Eval-InPage $ws "window.__dbxCmd = null; 1"
+                    $co = $ctxt | ConvertFrom-Json
+                    if ($co.action) { Invoke-DaemonCmd ([string]$co.action) }
+                }
+            } catch { }
+
             $chk = Eval-InPage $ws "!!document.getElementById('dbx-root')"
             $present = $false
             if ($chk.result -and $chk.result.result) { $present = [bool]$chk.result.result.value }
@@ -777,3 +1131,9 @@ while ($true) {
     }
     Start-Sleep -Milliseconds $PollMs
 }
+
+Write-Log 'daemon exit'
+foreach ($k in @($script:Sessions.Keys)) {
+    try { $script:Sessions[$k].ws.Dispose() } catch { }
+}
+try { Remove-Item -LiteralPath $lockF -Force -ErrorAction SilentlyContinue } catch { }

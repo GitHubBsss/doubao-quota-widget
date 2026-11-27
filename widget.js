@@ -211,6 +211,11 @@ function dbxWidget(data) {
 
   var rowsBox = document.createElement('div');
 
+  var compact = false;
+  try { compact = localStorage.getItem('dbxCompact') === '1'; } catch (e) { }
+  var COMPACT_HIDE = ['已用 / 总额', '最近窗口归零', '版本', '额度档位'];
+  var lastRows = [];
+
   function rowNode(label, value, color) {
     var row = document.createElement('div');
     row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:12px;' +
@@ -230,8 +235,10 @@ function dbxWidget(data) {
   }
 
   function renderRows(rows) {
+    lastRows = rows || [];
     rowsBox.textContent = '';
-    (rows || []).forEach(function (pair) {
+    lastRows.forEach(function (pair) {
+      if (compact && COMPACT_HIDE.indexOf(pair[0]) >= 0) return;
       rowsBox.appendChild(rowNode(pair[0], pair[1], pair[2]));
     });
   }
@@ -346,13 +353,138 @@ function dbxWidget(data) {
 
   renderWeek(data.week);
 
+  /* ---------- 生成指标：劫持 fetch 读回复流（首字延迟 / 真实 usage） ---------- */
+  var NET = { list: [] };
+  window.__dbxNet = NET;
+
+  (function patchFetch() {
+    if (window.__dbxFetchPatched) return;
+    window.__dbxFetchPatched = true;
+    var orig = window.fetch;
+    if (typeof orig !== 'function') return;
+
+    window.fetch = function (input, init) {
+      var url = '';
+      try { url = (typeof input === 'string') ? input : ((input && input.url) || ''); } catch (e) { }
+      var p = orig.apply(this, arguments);
+      if (!/chat|completion|conversation|generate|sse|stream|message/i.test(url)) return p;
+
+      var start = performance.now();
+      return p.then(function (res) {
+        try {
+          if (!res || !res.body || !res.clone) return res;
+          var ct = (res.headers && res.headers.get('content-type')) || '';
+          if (!/event-stream|stream|text\/plain|json/i.test(ct)) return res;
+
+          var entry = { url: url, start: start, first: 0, end: 0, bytes: 0, usage: null };
+          NET.list.push(entry);
+          if (NET.list.length > 20) NET.list.shift();
+
+          var clone = res.clone();
+          (function readStream() {
+            var reader = clone.body.getReader();
+            var dec = new TextDecoder('utf-8');
+            var buf = '';
+            function pump() {
+              return reader.read().then(function (r) {
+                if (r.done) {
+                  entry.end = performance.now();
+                  parseUsage(buf, entry);
+                  return;
+                }
+                if (!entry.first) entry.first = performance.now() - start;
+                var txt = dec.decode(r.value, { stream: true });
+                entry.bytes += txt.length;
+                buf += txt;
+                if (buf.length > 12000) buf = buf.slice(-8000);
+                return pump();
+              }).catch(function () { });
+            }
+            pump();
+          })();
+        } catch (e) { }
+        return res;
+      });
+    };
+  })();
+
+  function parseUsage(buf, entry) {
+    try {
+      var m = buf.match(/"usage"\s*:\s*\{[^}]{0,600}\}/g);
+      if (!m) return;
+      var last = m[m.length - 1];
+      function num(k) {
+        var r = new RegExp('"' + k + '"\\s*:\\s*(\\d+)');
+        var x = last.match(r);
+        return x ? parseInt(x[1], 10) : 0;
+      }
+      entry.usage = {
+        prompt: num('prompt_tokens'),
+        completion: num('completion_tokens'),
+        cached: num('cached_tokens') || num('cache_read_input_tokens')
+      };
+      if (!entry.usage.prompt && !entry.usage.completion) entry.usage = null;
+    } catch (e) { }
+  }
+
+  /* XHR 也采样（桌面端不少接口走 XMLHttpRequest） */
+  (function patchXhr() {
+    if (window.__dbxXhrPatched) return;
+    window.__dbxXhrPatched = true;
+    var OX = window.XMLHttpRequest;
+    if (!OX) return;
+    var open = OX.prototype.open;
+    var send = OX.prototype.send;
+    OX.prototype.open = function (m, u) {
+      try { this.__dbxUrl = String(u); this.__dbxStart = performance.now(); } catch (e) { }
+      return open.apply(this, arguments);
+    };
+    OX.prototype.send = function () {
+      var xhr = this;
+      try {
+        if (/chat|message|completion|conversation|generate|queue|sse|stream/i.test(xhr.__dbxUrl || '')) {
+          var e = { url: xhr.__dbxUrl, start: xhr.__dbxStart || performance.now(), first: 0, end: 0, bytes: 0, usage: null, buf: '', kind: 'xhr' };
+          NET.list.push(e);
+          if (NET.list.length > 40) NET.list.shift();
+          var grab = function (done) {
+            try {
+              if (!e.first) e.first = performance.now() - e.start;
+              var t = '';
+              if (xhr.responseType === '' || xhr.responseType === 'text') t = xhr.responseText || '';
+              else if (xhr.responseType === 'json' && xhr.response) t = JSON.stringify(xhr.response);
+              if (t) {
+                e.bytes = t.length;
+                e.buf = t.length > 14000 ? t.slice(-10000) : t;
+                parseUsage(e.buf, e);
+              }
+              if (done) e.end = performance.now();
+            } catch (x) { }
+          };
+          xhr.addEventListener('progress', function () { grab(false); });
+          xhr.addEventListener('load', function () { grab(true); });
+        }
+      } catch (x) { }
+      return send.apply(this, arguments);
+    };
+  })();
+
+  function latestNet(maxAgeMs) {
+    var now = performance.now();
+    for (var i = NET.list.length - 1; i >= 0; i--) {
+      var e = NET.list[i];
+      if (e.first > 0 && now - e.start < (maxAgeMs || 5 * 60 * 1000)) return e;
+    }
+    return null;
+  }
+
   /* ---------- 会话统计（读聊天 DOM，纯估算） ---------- */
   var liveBox = document.createElement('div');
   liveBox.style.cssText = 'margin-top:8px;padding-top:8px;border-top:1px solid ' + P.line + ';display:none';
   panel.insertBefore(liveBox, trendBox);
 
   var stat = {
-    lastLen: -1, growAt: 0, startAt: 0, startLen: 0, streaming: false, turns: []
+    lastLen: -1, growAt: 0, startAt: 0, startLen: 0, streaming: false,
+    thinkStart: 0, thinkSec: 0, turns: [], pendingAt: 0, firstMs: 0, rowCount: 0
   };
 
   function findList() {
@@ -388,42 +520,110 @@ function dbxWidget(data) {
       }
     }
 
-    /* 流式增量 → 本轮速度 */
     var now = Date.now();
+
+    /* 思考框出现 → 记开始；正文开始增长时收口 */
+    var thinking = ml.querySelector('[class*="thinking-box"], [class*="clear-thinking"], [class*="container-Ttbstn"]');
+    if (thinking && !stat.streaming && !stat.thinkStart) stat.thinkStart = now;
+
+    /* 流式增量 → 本轮速度 */
     if (lastAssistant) {
       if (stat.lastLen >= 0 && lastLen > stat.lastLen) {
         if (!stat.streaming) {
           stat.streaming = true;
           stat.startAt = now;
           stat.startLen = stat.lastLen;
+          if (stat.thinkStart) {
+            stat.thinkSec = +((now - stat.thinkStart) / 1000).toFixed(1);
+            stat.thinkStart = 0;
+          }
         }
         stat.growAt = now;
       } else if (stat.streaming && now - stat.growAt > 1400) {
         var n = lastLen - stat.startLen;
         var sec = (stat.growAt - stat.startAt) / 1000;
         if (n > 2 && sec > 0.4) {
-          stat.turns.push({ c: n, s: +(n / sec).toFixed(1), t: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) });
+          var tools = 0;
+          try {
+            tools = lastAssistant.querySelectorAll('[class*="tool-call"], [class*="toolCall"], [data-tool-call]').length;
+          } catch (e) { }
+          stat.turns.push({
+            c: n, s: +(n / sec).toFixed(1),
+            dur: +sec.toFixed(1),
+            think: stat.thinkSec,
+            tools: tools,
+            t: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+          });
           if (stat.turns.length > 5) stat.turns.shift();
         }
         stat.streaming = false;
+        stat.thinkSec = 0;
       }
       stat.lastLen = lastLen;
     }
 
     var tok = Math.round(chars / 1.55);
+    var lastTurn = stat.turns.length ? stat.turns[stat.turns.length - 1] : null;
+    var net = latestNet(3 * 60 * 1000);
+
+    // 首字延迟兜底：从「用户消息出现」到「助手开始出字」
+    var nowMs = Date.now();
+    if (rows.length > stat.rowCount) {
+      var lastRow = rows[rows.length - 1];
+      if (String(lastRow.className).indexOf('justify-end') >= 0) {
+        stat.pendingAt = nowMs;
+        stat.firstMs = 0;
+      }
+    }
+    stat.rowCount = rows.length;
+    if (lastAssistant && lastLen > 0 && stat.pendingAt && !stat.firstMs) {
+      stat.firstMs = nowMs - stat.pendingAt;
+    }
+
+    var speedText = '—';
+    if (stat.streaming) {
+      speedText = '生成中…';
+    } else if (lastTurn) {
+      speedText = fmtK(lastTurn.c) + ' 字 · ' + lastTurn.s + ' 字/秒';
+      if (stat.turns.length > 1) {
+        var prev = stat.turns[stat.turns.length - 2].s;
+        if (prev > 0) {
+          var delta = Math.round((lastTurn.s - prev) / prev * 100);
+          if (delta !== 0) speedText += '（较上轮 ' + (delta > 0 ? '+' : '') + delta + '%）';
+        }
+      }
+    }
+
+    var firstText = (net && net.first) ? (Math.round(net.first) + ' ms') : (stat.firstMs ? (stat.firstMs + ' ms') : '—');
+    var tokText = '—';
+    if (lastTurn) {
+      if (net && net.usage && net.usage.completion > 0) {
+        tokText = fmtK(net.usage.completion) + ' tok（真实）';
+      } else {
+        tokText = '≈' + fmtK(Math.round(lastTurn.c / 1.55)) + ' tok';
+      }
+    }
+
     var liveRows = [
       ['会话上下文', msgs + ' 条 · ' + fmtK(chars) + ' 字 ≈ ' + fmtK(tok) + ' tok'],
-      ['本轮输出', stat.streaming ? '生成中…' : (stat.turns.length ? (fmtK(stat.turns[stat.turns.length - 1].c) + ' 字 · ' + stat.turns[stat.turns.length - 1].s + ' 字/秒') : '—')]
+      ['本轮输出', speedText],
+      ['首字延迟', firstText],
+      ['本次 Token', tokText]
     ];
 
     liveBox.textContent = '';
     liveBox.style.display = 'block';
     liveRows.forEach(function (p) { liveBox.appendChild(rowNode(p[0], p[1], P.sub)); });
 
-    if (stat.turns.length > 1) {
+    if (stat.turns.length > 0) {
       var hist = document.createElement('div');
       hist.style.cssText = 'color:' + P.dim + ';font-size:10px;line-height:1.6;padding-top:4px';
-      hist.textContent = '最近 ' + stat.turns.length + ' 轮：' + stat.turns.map(function (x) { return x.t + ' ' + x.s; }).join(' · ');
+      hist.textContent = '最近 ' + stat.turns.length + ' 轮：' + stat.turns.map(function (x) {
+        var s = x.t + ' ' + x.s;
+        if (x.think) s += '/思' + x.think + 's';
+        if (x.tools) s += '/具' + x.tools;
+        return s;
+      }).join(' · ');
       liveBox.appendChild(hist);
     }
   }
@@ -480,6 +680,97 @@ function dbxWidget(data) {
     }
   }
 
+  /* ---------- 右键菜单 ---------- */
+  var menu = document.createElement('div');
+  menu.style.cssText = [
+    'position:fixed', 'z-index:2147483647', 'display:none',
+    'min-width:158px', 'padding:4px',
+    'background:' + P.panelBg, 'border:1px solid ' + P.panelBorder,
+    'border-radius:8px', 'box-shadow:' + P.shadow,
+    'font-size:12px', 'color:' + P.text, 'pointer-events:auto'
+  ].join(';');
+
+  var menuPauseItem = null;
+
+  function menuItem(label, fn) {
+    var it = document.createElement('div');
+    it.textContent = label;
+    it.style.cssText = 'padding:6px 10px;border-radius:5px;cursor:pointer;white-space:nowrap';
+    it.addEventListener('mouseenter', function () { it.style.background = LIGHT ? 'rgba(0,0,0,.05)' : 'rgba(255,255,255,.07)'; });
+    it.addEventListener('mouseleave', function () { it.style.background = 'transparent'; });
+    it.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      hideMenu();
+      try { fn(); } catch (e) { }
+    });
+    menu.appendChild(it);
+    return it;
+  }
+
+  var paused = false;
+
+  menuItem('刷新数据', function () { window.__dbxCmd = { action: 'refresh', at: Date.now() }; });
+  menuPauseItem = menuItem('暂停刷新', function () {
+    paused = !paused;
+    window.__dbxCmd = { action: paused ? 'pause' : 'resume', at: Date.now() };
+    menuPauseItem.textContent = paused ? '恢复刷新' : '暂停刷新';
+  });
+  menuItem('导出 CSV', function () { window.__dbxCmd = { action: 'export', at: Date.now() }; });
+  menuItem('用量报表', function () { window.__dbxCmd = { action: 'report', at: Date.now() }; });
+  menuItem('打开数据目录', function () { window.__dbxCmd = { action: 'open', at: Date.now() }; });
+  menuItem('紧凑模式', function () {
+    compact = !compact;
+    try { localStorage.setItem('dbxCompact', compact ? '1' : '0'); } catch (e) { }
+    renderRows(lastRows);
+  });
+  menuItem('退出守护', function () { window.__dbxCmd = { action: 'quit', at: Date.now() }; });
+
+  function showMenu(x, y) {
+    menu.style.display = 'block';
+    var w = menu.offsetWidth || 160, h = menu.offsetHeight || 240;
+    menu.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+  }
+
+  function hideMenu() { menu.style.display = 'none'; }
+
+  ball.addEventListener('contextmenu', function (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    var rc = ball.getBoundingClientRect();
+    var w = menu.offsetWidth || 160;
+    var mx = rc.left - w - 8;
+    if (mx < 8) mx = rc.right + 8;
+    showMenu(mx, rc.top);
+  });
+
+  document.addEventListener('click', hideMenu, true);
+
+  /* ---------- 快捷键 Ctrl+Alt+Q 显示/隐藏 ---------- */
+  document.addEventListener('keydown', function (ev) {
+    if (ev.ctrlKey && ev.altKey && (ev.key === 'q' || ev.key === 'Q')) {
+      ev.preventDefault();
+      root.style.display = (root.style.display === 'none') ? '' : 'none';
+    }
+  }, true);
+
+  /* ---------- 闲置缩小 ---------- */
+  var idleTimer = null;
+  function restoreScale() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    ball.style.transform = '';
+    ball.style.opacity = '1';
+  }
+  function startIdle() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      if (!drag) {
+        ball.style.transform = 'scale(.62)';
+        ball.style.opacity = '.85';
+      }
+    }, 5000);
+  }
+
   /* ---------- 拖动定位 ---------- */
   var drag = null;
   var dragged = false;
@@ -516,7 +807,21 @@ function dbxWidget(data) {
     ball.style.cursor = 'grab';
     try { ball.releasePointerCapture(ev.pointerId); } catch (e) { }
     var r = root.getBoundingClientRect();
-    var p = { left: Math.round(r.left), top: Math.round(r.top) };
+    var w = r.width, h = r.height;
+
+    /* 贴边自动吸附（离边缘 24px 内） */
+    var left = Math.round(r.left), top = Math.round(r.top);
+    if (left < 24) left = 8;
+    if (window.innerWidth - (left + w) < 24) left = Math.round(window.innerWidth - w - 8);
+    if (top < 24) top = 8;
+    if (window.innerHeight - (top + h) < 24) top = Math.round(window.innerHeight - h - 8);
+
+    root.style.right = 'auto';
+    root.style.left = left + 'px';
+    root.style.top = top + 'px';
+    applyPanelSide(left + w / 2);
+
+    var p = { left: left, top: top };
     window.__dbxPos = p;
     try { localStorage.setItem('dbxBallPos', JSON.stringify(p)); } catch (e) { }
   }
@@ -524,10 +829,10 @@ function dbxWidget(data) {
   ball.addEventListener('pointerup', endDrag);
   ball.addEventListener('pointercancel', endDrag);
 
-  ball.addEventListener('mouseenter', show);
-  ball.addEventListener('mouseleave', function () { hide(220); });
+  ball.addEventListener('mouseenter', function () { restoreScale(); show(); });
+  ball.addEventListener('mouseleave', function () { hide(220); startIdle(); });
   panel.addEventListener('mouseenter', function () { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } });
-  panel.addEventListener('mouseleave', function () { hide(120); });
+  panel.addEventListener('mouseleave', function () { hide(120); startIdle(); });
 
   /* 双击打开额度管理页 */
   ball.addEventListener('dblclick', function () {
@@ -540,6 +845,7 @@ function dbxWidget(data) {
   wrap.appendChild(ball);
   wrap.appendChild(panel);
   root.appendChild(wrap);
+  root.appendChild(menu);
   document.documentElement.appendChild(root);
 
   var r0 = root.getBoundingClientRect();
@@ -565,11 +871,18 @@ function dbxWidget(data) {
       pulse.style.transform = 'scale(1)';
     }
     if (d.openUrl) data.openUrl = d.openUrl;
+    if (typeof d.paused === 'boolean') {
+      paused = d.paused;
+      if (menuPauseItem) menuPauseItem.textContent = paused ? '恢复刷新' : '暂停刷新';
+    }
     return true;
   };
 
   /* 首次也要应用 alert */
-  window.__dbxWidgetUpdate({ alert: data.alert });
+  window.__dbxWidgetUpdate({ alert: data.alert, paused: data.paused });
+
+  /* 注入后 5 秒如无操作，缩成小圆点 */
+  startIdle();
 
   return true;
 }

@@ -1,5 +1,6 @@
 {
   "aid": "",
   "scale": 1,
-  "alert_pct": 20
+  "alert_pct": 20,
+  "quiet_hours": ""
 }
