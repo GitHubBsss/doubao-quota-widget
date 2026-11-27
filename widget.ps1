@@ -70,14 +70,17 @@ switch ($Action.Trim().ToLower()) {
         Write-Host ('守护进程: ' + $(if ($p) { "运行中 (pid=$p)" } else { '未运行' }))
         if (Test-Path -LiteralPath $pauseF) { Write-Host '采样状态: 已暂停' } else { Write-Host '采样状态: 运行中' }
         if (Test-Path -LiteralPath $dataF) {
-            try {
-                $d = Get-Content -LiteralPath $dataF -Raw | ConvertFrom-Json
+            $d = $null
+            for ($i = 0; $i -lt 4; $i++) {
+                try { $d = Get-Content -LiteralPath $dataF -Raw | ConvertFrom-Json; break } catch { Start-Sleep -Milliseconds 150 }
+            }
+            if ($d) {
                 Write-Host ('版本: ' + $d.ver)
                 Write-Host ('额度: ' + $d.badge)
                 foreach ($r in @($d.rows)) { Write-Host ('  ' + $r[0] + ': ' + $r[1]) }
                 $t = Get-Item -LiteralPath $dataF
                 Write-Host ('数据更新时间: ' + $t.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
-            } catch { Write-Host 'data.json 解析失败' }
+            } else { Write-Host 'data.json 解析失败' }
         }
         if (Test-Path -LiteralPath $reportF) { Write-Host ('周报: ' + $reportF) }
         if (Test-Path -LiteralPath $dashF) { Write-Host ('报表: ' + $dashF) }
