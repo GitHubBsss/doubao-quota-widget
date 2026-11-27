@@ -72,7 +72,7 @@ switch ($Action.Trim().ToLower()) {
         if (Test-Path -LiteralPath $dataF) {
             $d = $null
             for ($i = 0; $i -lt 4; $i++) {
-                try { $d = Get-Content -LiteralPath $dataF -Raw | ConvertFrom-Json; break } catch { Start-Sleep -Milliseconds 150 }
+                try { $d = [IO.File]::ReadAllText($dataF, [Text.Encoding]::UTF8) | ConvertFrom-Json; break } catch { Start-Sleep -Milliseconds 150 }
             }
             if ($d) {
                 Write-Host ('版本: ' + $d.ver)
