@@ -174,7 +174,7 @@ switch ($Action.Trim().ToLower()) {
             break
         }
 
-        $files = @('widget.js', 'doubao-widget-daemon.ps1', 'widget.ps1', 'start-daemon.vbs', 'install.ps1', 'install.cmd', 'uninstall.ps1', 'uninstall.cmd', 'README.md', 'config.example.json', 'version.json')
+        $files = @('widget.js', 'doubao-widget-daemon.ps1', 'widget.ps1', 'start-daemon.vbs', 'install.ps1', 'install.cmd', 'uninstall.ps1', 'uninstall.cmd', 'README.md', 'config.example.json', 'version.json', '安装额度球.cmd', '卸载额度球.cmd', '修复额度球.cmd')
         $backupDir = Join-Path $here ('backup-' + $stamp)
         New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
         foreach ($f in $files) {

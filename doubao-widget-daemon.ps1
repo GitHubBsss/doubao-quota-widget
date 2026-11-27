@@ -685,7 +685,7 @@ function Get-ModelParts([string]$m) {
 }
 
 # ---------- 版本 / 更新检查 / 低额度提醒 ----------
-$script:Version    = '1.3.2'
+$script:Version    = '1.3.3'
 $script:UpdateNote = ''
 $script:UpdateAt   = [DateTime]::MinValue
 $script:AlertLevel = ''

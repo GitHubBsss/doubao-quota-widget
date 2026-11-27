@@ -166,6 +166,13 @@ $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 New-ItemProperty -Path $runKey -Name 'DoubaoWidget' -Value ('"{0}" "{1}"' -f $wscript, $vbs) -PropertyType String -Force | Out-Null
 Say '  已写入 HKCU Run: DoubaoWidget'
 
+# 每 2 分钟检查一次；守护崩溃/豆包更新把进程带走后会自动拉起
+$taskName = 'DoubaoWidgetWatchdog'
+$taskRun = ('"{0}" "{1}"' -f $wscript, $vbs)
+& schtasks /Create /TN $taskName /TR $taskRun /SC MINUTE /MO 2 /F 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { Say '  已注册看门狗：每 2 分钟自动检查一次' }
+else { Say '  看门狗注册失败，不影响本次使用；挂件消失时双击 install.cmd 重装即可' 'Yellow' }
+
 $lock = Join-Path $here 'daemon.lock'
 $running = $false
 if (Test-Path -LiteralPath $lock) {

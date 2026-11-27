@@ -6,6 +6,8 @@ $port = 9222
 function Say([string]$text, [string]$color = 'Gray') { Write-Host $text -ForegroundColor $color }
 
 Say '停止挂件守护进程…'
+& schtasks /Delete /TN 'DoubaoWidgetWatchdog' /F 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { Say '  已删除看门狗任务' }
 $lock = Join-Path $here 'daemon.lock'
 if (Test-Path -LiteralPath $lock) {
     $pidTxt = (Get-Content -LiteralPath $lock -Raw -ErrorAction SilentlyContinue).Trim()
