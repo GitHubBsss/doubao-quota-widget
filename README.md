@@ -1,21 +1,37 @@
 # doubao-quota-widget
 
-给豆包（Doubao）Windows 桌面客户端加一个「打开就在」的悬浮额度球：环形显示剩余额度、悬停展开明细面板、双击打开额度管理页。全程不额外启动窗口程序，靠 CDP 把挂件注入到豆包自己的聊天页面里。
+给豆包（Doubao）Windows 桌面客户端加一个「打开就在」的悬浮额度球：环形显示剩余额度、悬停展开明细面板、双击打开额度管理页，并给出按当前速度预计还能用多久。全程不额外启动窗口程序，靠 CDP 把挂件注入到豆包自己的聊天页面里。
 
 ## 效果
 
 - **环形额度球**：满圈 = 当前积分总量，亮色弧 = 剩余占比，圈内直接写剩余积分。剩余低于 50% 转琥珀色，低于 20% 转红色。
 - **两格套圈**：账号带「5 小时 / 周」窗口限额时，外层金色 = 周限额、内层蓝色 = 5 小时限额，各自按自己的剩余百分比点亮。没有这类窗口时只有一格。
-- **悬停面板**：当前模型（含推理档位）、可用额度、已用 / 总额及百分比、今日新增消耗、最近窗口归零时间、额度档位、30 秒刷新时间，底部是今日消耗趋势折线。
+- **悬停面板**：当前模型（含推理档位）、可用额度、已用 / 总额及百分比、今日新增消耗、消耗速度、预计用完、最近窗口归零时间、额度档位、刷新时间，底部是今日消耗趋势折线。
 - **双击**球体打开豆包官方「订阅与额度管理」页面。
 - **可拖动**：按住球拖动，位置落到 `widget-pos.json`，重启客户端/重建挂件后仍然复用；球在左半边时面板自动向右展开。
 
+## 一键安装
+
+1. 把仓库下载或克隆到本机（目录里要有 `install.cmd`）。
+2. 双击 `install.cmd`。
+
+脚本会依次做四件事，全程无需手工填参数：
+
+1. 定位豆包客户端（运行中的进程、桌面/开始菜单快捷方式、注册表卸载项、常见安装路径都会找）；
+2. 给桌面和开始菜单的「豆包」快捷方式补上 `--remote-debugging-port=9222` 参数，原快捷方式备份为 `.lnk.bak`；
+3. 如果豆包正在运行但没开调试端口，会关掉并按带参数的方式重新拉起（`-NoRestart` 可跳过这步）；
+4. 写入开机自启（`HKCU\...\Run\DoubaoWidget`，用 `wscript` 静默启动），然后无窗口拉起守护进程，并校验页面里挂件是否已注入。
+
+**不需要填 aid。** 守护进程会从页面 `localStorage` 的 `client_device_info.appId` 自动识别账号参数；需要覆盖时可以用环境变量 `DOUBAO_AID` 或同目录 `config.json`（模板见 `config.example.json`）。
+
+卸载：双击 `uninstall.cmd`，会停守护、删自启、还原快捷方式、清掉页面里的挂件。
+
 ## 工作原理
 
-1. 豆包客户端带 `--remote-debugging-port=9222` 启动，Chromium 的调试端口可用。
-2. 主聊天页是 `doubao://doubao-chat/chat/...` 私有协议，浏览器扩展匹配不到；但 CDP 不看协议，因此走 CDP 注入。
-3. `doubao-widget-daemon.ps1` 常驻（无控制台窗口），每 2.5 秒检查页面里挂件是否还在，不在就重新注入 `widget.js`；每 30 秒通过页面内的 `drive-iframe` 上下文调额度接口刷新数据，并原地更新 DOM。
-4. 挂件是纯 DOM + SVG，无依赖、无外部资源。
+1. 豆包客户端带 `--remote-debugging-port=9222` 启动，Chromium 调试端口可用。
+2. 主聊天页是 `doubao://doubao-chat/chat/...` 私有协议，浏览器扩展匹配不到；CDP 不看协议，因此走 CDP 注入。
+3. `doubao-widget-daemon.ps1` 常驻（无控制台窗口），每 2.5 秒检查挂件是否还在，不在就重新注入；每 30 秒通过页面里的 `drive-iframe` 上下文调额度接口刷新数据，并原地更新 DOM。
+4. 挂件是纯 DOM + SVG，无第三方依赖。
 
 ## 环境要求
 
@@ -24,71 +40,36 @@
 - 豆包桌面客户端（在 Chromium 147 上验证）
 - Node.js 仅 `tools/` 下的调试脚本需要，主程序不需要
 
-## 安装
-
-### 1. 让豆包带调试端口启动
-
-找到豆包快捷方式（桌面或开始菜单），右键 → 属性 → 目标，在原有路径后追加参数：
-
-```
---remote-debugging-port=9222
-```
-
-例如：
-
-```
-"D:\Soft\Doubao\app\Doubao.exe" --remote-debugging-port=9222
-```
-
-指向 `app\Doubao.exe` 而不是外层启动器，避免启动器不透传参数。改完重新打开豆包，访问 `http://127.0.0.1:9222/json/version` 能看到 JSON 即成功。
-
-### 2. 填写账号参数
-
-复制 `config.example.json` 为 `config.json`，填入自己的 `aid`：
-
-```json
-{ "aid": "你的aid" }
-```
-
-`aid` 是额度请求 URL 里的账号维度参数。打开豆包额度管理页，在开发者工具的网络面板里找 `alice/commerce/sale/subscription/overview/` 这条请求，URL 上的 `aid=` 就是。也可以用环境变量 `DOUBAO_AID` 代替配置文件。
-
-### 3. 启动守护进程
-
-```powershell
-wscript.exe start-daemon.vbs
-```
-
-`wscript` 是 GUI 子系统，不会弹出控制台窗口。启动后右侧出现额度球，日志写在 `daemon.log`。
-
-### 4. 开机自启（可选）
-
-```powershell
-$vbs = "D:\path\to\doubao-quota-widget\start-daemon.vbs"
-New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'DoubaoWidget' `
-  -Value ('"C:\Windows\System32\wscript.exe" "{0}"' -f $vbs) -PropertyType String -Force
-```
-
-删除该值即可取消自启。
-
 ## 目录结构
 
 ```
-widget.js                 注入到页面的挂件（环形球 + 面板 + 拖动 + 原地更新）
-doubao-widget-daemon.ps1  守护进程：CDP 连接、注入保活、额度拉取、数据落盘
-start-daemon.vbs          无窗口启动器
-config.example.json       账号参数模板
-tools/cdp-eval.js         调试用：在页面里执行表达式，可截图
-tools/quota-fetch.js      调试用：直接调额度接口看返回
-tools/capture-quota.js    调试用：抓额度接口响应
-tools/capture-stream.js   调试用：抓对话流响应（用于分析 token/缓存字段）
-tools/inject.js           早期一次性注入载荷，保留作参考
+install.cmd / install.ps1        一键安装（改快捷方式、自启、拉起守护）
+uninstall.cmd / uninstall.ps1    一键卸载（停守护、还原快捷方式、清挂件）
+widget.js                        注入到页面的挂件（环形球 + 面板 + 拖动 + 原地更新）
+doubao-widget-daemon.ps1         守护进程：CDP 注入保活、额度拉取、速度估算、数据落盘
+start-daemon.vbs                 无窗口启动器
+config.example.json              可选的账号参数覆盖模板
+tools/cdp-eval.js                调试用：在页面里执行表达式，可截图
+tools/quota-fetch.js             调试用：直接调额度接口看返回
+tools/capture-quota.js           调试用：抓额度接口响应
+tools/capture-stream.js          调试用：抓对话流响应（用于分析 token/缓存字段）
+tools/inject.js                  早期一次性注入载荷，保留作参考
 ```
 
 运行时产物（`data.json`、`quota-history.json`、`widget-pos.json`、`daemon.log` 等）已在 `.gitignore` 中排除。
 
+## 预计用完怎么算
+
+守护进程每 30 秒记一条额度采样（已用点数），面板里给两个派生值：
+
+- **消耗速度**：优先取最近 6 小时窗口内的正向增量（额度窗口到期归零导致的回落不计）；采样跨度不足 2 小时时，退回已采样区间的平均值，并标注「近期均值」。
+- **预计用完**：剩余积分 ÷ 当前速度。小于 1 小时按分钟显示，48 小时内按小时，更长按天；速度为 0 时显示「—」。
+
+速度是滚动量，停止使用一段时间后会自动回落，所以这个时间只代表「按现在这个节奏」。
+
 ## 数据格式
 
-`data.json` 是守护进程写给挂件的数据，字段如下：
+`data.json` 是守护进程写给挂件的数据：
 
 | 字段 | 说明 |
 | --- | --- |

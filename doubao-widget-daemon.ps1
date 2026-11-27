@@ -87,19 +87,31 @@ function Eval-InPage($ws, [string]$expr, [bool]$await = $false) {
 }
 
 # ---------- 真实额度抓取 ----------
-# aid 是豆包账号维度参数，从同目录 config.json 或环境变量 DOUBAO_AID 读取，避免把个人账号写进代码
-$Aid = $null
+# aid 优先取 config.json / 环境变量；都没有时从页面 localStorage 的 client_device_info.appId 自动识别
+$script:Aid = ''
 $cfgF = Join-Path $here 'config.json'
 if (Test-Path -LiteralPath $cfgF) {
     try {
         $cfg = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json
-        if ($cfg.aid) { $Aid = [string]$cfg.aid }
+        if ($cfg.aid) { $script:Aid = [string]$cfg.aid }
     } catch { }
 }
-if (-not $Aid -and $env:DOUBAO_AID) { $Aid = $env:DOUBAO_AID }
-if (-not $Aid) { Write-Log 'config.json 缺少 aid，额度接口将无法查询'; $Aid = '0' }
+if (-not $script:Aid -and $env:DOUBAO_AID) { $script:Aid = [string]$env:DOUBAO_AID }
 
-$QuotaApi = 'https://www.doubao.com/alice/commerce/sale/subscription/overview/?aid=' + $Aid + '&device_platform=web&doubao_device_platform=web&language=zh&region=CN&sys_region=CN&samantha_web=1&web_platform=desktop&use-olympus-account=1&pc_version=2.38.12'
+$QuotaBase = 'https://www.doubao.com/alice/commerce/sale/subscription/overview/?aid=__AID__&device_platform=web&doubao_device_platform=web&language=zh&region=CN&sys_region=CN&samantha_web=1&web_platform=desktop&use-olympus-account=1&pc_version=2.38.12'
+
+function Resolve-Aid($list) {
+    $t = $list | Where-Object { $_.type -eq 'page' -and $_.url -match 'doubao-chat/chat' } | Select-Object -First 1
+    if (-not $t) { return '' }
+    $ws = Connect-Cdp $t.webSocketDebuggerUrl
+    try {
+        $r = Eval-InPage $ws "try{JSON.parse(localStorage.getItem('client_device_info')).appId}catch(e){''}"
+        if ($r.result -and $r.result.result) { return [string]$r.result.result.value }
+        return ''
+    } finally {
+        try { $ws.Dispose() } catch { }
+    }
+}
 
 $QuotaExpr = @'
 (async () => {
@@ -127,7 +139,16 @@ function Get-QuotaMetrics($list) {
 
     $ws = Connect-Cdp $ctx.webSocketDebuggerUrl
     try {
-        $expr = $QuotaExpr.Replace('__API__', $QuotaApi)
+        if (-not $script:Aid) {
+            try {
+                $script:Aid = Resolve-Aid $list
+                if ($script:Aid) { Write-Log ('aid -> ' + $script:Aid) }
+            } catch { }
+        }
+        if (-not $script:Aid) { throw 'aid 未识别（可从 config.json 或 DOUBAO_AID 指定）' }
+
+        $api  = $QuotaBase.Replace('__AID__', $script:Aid)
+        $expr = $QuotaExpr.Replace('__API__', $api)
         $res  = Eval-InPage $ws $expr $true
         $raw  = $res.result.result.value
         if (-not $raw) { throw 'empty quota response' }
@@ -243,6 +264,49 @@ function Get-TodayTrend {
     return @{ Points = $pts; Consumed = $total }
 }
 
+# ---------- 消耗速度与预计用完 ----------
+function Get-UsageRate {
+    # 优先用近 6 小时窗口的真实增量；采样跨度不足 2 小时时退回「今日累计 / 今日已过时长」，避免短样本把速度算爆
+    $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+    $startMs = $nowMs - 6 * 60 * 60 * 1000
+    $s = @($script:History | Where-Object { [int64]$_.t -ge $startMs })
+
+    if ($s.Count -ge 2) {
+        $burned = 0.0
+        $prevU = [double]$s[0].u
+        foreach ($x in $s) {
+            $u = [double]$x.u
+            $d = $u - $prevU
+            if ($d -gt 0) { $burned += $d }
+            $prevU = $u
+        }
+        $spanMs = [int64]$s[$s.Count - 1].t - [int64]$s[0].t
+        $hours = $spanMs / 3600000.0
+        if ($hours -ge 2 -and $burned -gt 0) {
+            return @{ Rate = $burned / $hours; Basis = '6h' }
+        }
+    }
+
+    # 退回今日口径
+    $now = Get-Date
+    $midnightMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() - ($now - $now.Date).TotalMilliseconds
+    $today = @($script:History | Where-Object { [int64]$_.t -ge [int64]$midnightMs })
+    if ($today.Count -lt 2) { return @{ Rate = 0.0; Basis = '' } }
+
+    $hoursToday = ($nowMs - [int64]$today[0].t) / 3600000.0
+    if ($hoursToday -lt 0.5) { return @{ Rate = 0.0; Basis = '' } }
+    return @{ Rate = ([double]$script:Consumed) / $hoursToday; Basis = 'today' }
+}
+
+function Format-Duration([double]$h) {
+    if ($h -le 0) { return '' }
+    if (($h * 60) -lt 60) { return ('约 {0:0} 分钟' -f ($h * 60)) }
+    if ($h -lt 48) { return ('约 {0:0.0} 小时' -f $h) }
+    $d = $h / 24
+    if ($d -lt 365) { return ('约 {0:0.0} 天' -f $d) }
+    return '超过一年'
+}
+
 # ---------- 状态 ----------
 $script:DataJson = $null
 $script:DataAt   = [DateTime]::MinValue
@@ -327,11 +391,19 @@ function New-DataJson {
     $badge = $m.Badge
     $modelText = if ($mp.Name) { $mp.Name + $(if ($mp.Level) { ' · ' + $mp.Level } else { '' }) } else { '未识别' }
 
+    $usage = Get-UsageRate
+    $rateText = if ($usage.Rate -gt 0) {
+        ('{0:0.0} 点/小时{1}' -f $usage.Rate, $(if ($usage.Basis -eq 'today') { '（近期均值）' } else { '（近 6 小时）' }))
+    } else { '暂无消耗' }
+    $etaText  = if ($usage.Rate -gt 0 -and $m.RemainNum -gt 0) { Format-Duration ($m.RemainNum / $usage.Rate) } else { '—' }
+
     $rows = @(
         , @('当前模型', $modelText)
         , @('可用额度', $m.RemainStr)
         , @('已用 / 总额', ('{0:0} / {1:0}   {2}%' -f $m.Used, $m.Total, $m.Pct))
         , @('今日新增消耗', ('+{0:0}' -f $script:Consumed))
+        , @('消耗速度', $rateText)
+        , @('预计用完', $etaText)
         , @('最近窗口归零', $m.Expiry)
         , @('额度档位', ('{0} 档' -f $m.Count))
         , @('数据更新', (Get-Date -Format 'HH:mm'))
