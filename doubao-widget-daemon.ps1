@@ -89,11 +89,15 @@ function Eval-InPage($ws, [string]$expr, [bool]$await = $false) {
 # ---------- 真实额度抓取 ----------
 # aid 优先取 config.json / 环境变量；都没有时从页面 localStorage 的 client_device_info.appId 自动识别
 $script:Aid = ''
+$script:Scale = 1.0
+$script:AlertPct = 20
 $cfgF = Join-Path $here 'config.json'
 if (Test-Path -LiteralPath $cfgF) {
     try {
         $cfg = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json
         if ($cfg.aid) { $script:Aid = [string]$cfg.aid }
+        if ($null -ne $cfg.scale) { $script:Scale = [double]$cfg.scale }
+        if ($null -ne $cfg.alert_pct) { $script:AlertPct = [double]$cfg.alert_pct }
     } catch { }
 }
 if (-not $script:Aid -and $env:DOUBAO_AID) { $script:Aid = [string]$env:DOUBAO_AID }
@@ -133,6 +137,19 @@ function Format-Amount([string]$s) {
     return ('{0:0}' -f $n)
 }
 
+# 窗口重置倒计时：end_time 是毫秒时间戳
+function Format-Reset([string]$endTime) {
+    if (-not $endTime) { return '—' }
+    try {
+        $end = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$endTime).ToLocalTime()
+        $left = $end - [DateTimeOffset]::Now
+        if ($left.TotalMinutes -le 0) { return '已到期' }
+        if ($left.TotalHours -lt 1) { return ('剩 {0:0} 分钟' -f $left.TotalMinutes) }
+        if ($left.TotalHours -lt 48) { return ('剩 {0:0.0} 小时' -f $left.TotalHours) }
+        return ('剩 {0:0.0} 天' -f $left.TotalDays)
+    } catch { return '—' }
+}
+
 function Get-QuotaMetrics($list) {
     $ctx = $list | Where-Object { $_.url -match '^https://www\.doubao\.com/' } | Select-Object -First 1
     if (-not $ctx) { throw 'no doubao.com context' }
@@ -156,29 +173,56 @@ function Get-QuotaMetrics($list) {
         $q = $raw | ConvertFrom-Json
 
         $remainStr = [string]$q.data.quota_balance_overview.total_remaining_amount
-        $wl = $q.data.incentive_quota_section.window_limit_groups[0].window_limits[0]
-        $usedNum  = [double]([string]$wl.used_amount -replace ',', '')
-        $totalNum = [double]([string]$wl.total_amount -replace ',', '')
 
-        # 环形表：优先用付费档位的窗口限额（5 小时 / 周），没有就用整体剩余比例
-        $rings = @()
+        # 当前计费窗口（免费号也有一档）
+        $wl = $null
+        try { $wl = $q.data.incentive_quota_section.window_limit_groups[0].window_limits[0] } catch { }
+        $usedNum = 0.0; $totalNum = 0.0; $usedPct = 0.0; $expiry = '—'
+        if ($wl) {
+            $usedNum  = [double](([string]$wl.used_amount -replace ',', ''))
+            $totalNum = [double](([string]$wl.total_amount -replace ',', ''))
+            $usedPct  = [double]$wl.used_percent
+            $expiry   = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$wl.end_time).ToLocalTime().ToString('MM-dd HH:mm')
+        }
+
+        # 5 小时 / 周 / 月 窗口（有权益才存在；免费号为空）
+        $windows = @()
         try {
             foreach ($g in @($q.data.window_limit_section.window_limit_groups)) {
                 if (-not $g) { continue }
                 foreach ($w in @($g.window_limits)) {
                     if (-not $w) { continue }
-                    $rings += [pscustomobject]@{
-                        Pct  = [math]::Round(100 - [double]$w.used_percent, 0)
-                        Type = [string]$w.window_type
+                    $t = [string]$w.window_type
+                    $label = switch ($t) {
+                        'H5' { '5 小时额度' }
+                        'D7' { '本周额度' }
+                        'M1' { '本月额度' }
+                        default { '窗口额度' }
+                    }
+                    $windows += [pscustomobject]@{
+                        Type  = $t
+                        Label = $label
+                        Pct   = [math]::Round(100 - [double]$w.used_percent, 0)
+                        Reset = (Format-Reset ([string]$w.end_time))
                     }
                 }
             }
         } catch { }
+
+        # 环形表：外圈放周额度、内圈放 5 小时额度（顺序固定，颜色才好对应）；都没有就用整体剩余比例
+        $rings = @()
+        if ($windows.Count -gt 0) {
+            $rings = @($windows | Where-Object { $_.Type -eq 'D7' })
+            $rings += @($windows | Where-Object { $_.Type -eq 'H5' })
+            if ($rings.Count -eq 0) { $rings = @($windows) }
+        }
         if ($rings.Count -eq 0) {
             $pctRemain = if ($totalNum -gt 0) { 100 - (100 * $usedNum / $totalNum) } else { 100 }
             $rings = @([pscustomobject]@{ Pct = [math]::Round($pctRemain, 0); Type = 'all' })
         }
         if ($rings.Count -gt 2) { $rings = @($rings | Select-Object -First 2) }
+
+        $remainPct = if ($totalNum -gt 0) { [math]::Round(100 - (100 * $usedNum / $totalNum), 1) } else { 100 }
 
         return [pscustomobject]@{
             Badge     = Format-Amount $remainStr
@@ -186,11 +230,13 @@ function Get-QuotaMetrics($list) {
             RemainNum = [double]($remainStr -replace ',', '')
             Used      = $usedNum
             Total     = $totalNum
-            Pct       = $wl.used_percent
-            Expiry    = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$wl.end_time).ToLocalTime().ToString('MM-dd HH:mm')
+            Pct       = $usedPct
+            RemainPct = $remainPct
+            Expiry    = $expiry
             Count     = $q.data.incentive_quota_section.entitlement_count
             Member    = if ($q.data.member_info.hasActiveSubscription) { '订阅中' } else { '免费版' }
             Rings     = $rings
+            Windows   = $windows
         }
     } finally {
         try { $ws.Dispose() } catch { }
@@ -262,6 +308,37 @@ function Get-TodayTrend {
     if ($pts.Count -lt 2) { $pts = @(0, $pts[0]) }
 
     return @{ Points = $pts; Consumed = $total }
+}
+
+# ---------- 近 7 天每日消耗（按本地自然日切分，只累计正向增量） ----------
+function Get-WeekBuckets {
+    $today = (Get-Date).Date
+    $out = @()
+    for ($i = 6; $i -ge 0; $i--) {
+        $day = $today.AddDays(-$i)
+        $startMs = ([DateTimeOffset]$day).ToUnixTimeMilliseconds()
+        $endMs   = ([DateTimeOffset]$day.AddDays(1)).ToUnixTimeMilliseconds()
+
+        $prev = $null
+        foreach ($s in $script:History) {
+            if ([int64]$s.t -lt [int64]$startMs) { $prev = [double]$s.u } else { break }
+        }
+
+        $sum = 0.0
+        foreach ($s in $script:History) {
+            $t = [int64]$s.t
+            if ($t -lt $startMs) { continue }
+            if ($t -ge $endMs) { break }
+            $u = [double]$s.u
+            if ($null -eq $prev) { $prev = $u }
+            $d = $u - $prev
+            if ($d -gt 0) { $sum += $d }
+            $prev = $u
+        }
+
+        $out += [pscustomobject]@{ d = $day.ToString('MM-dd'); v = [int][math]::Round($sum) }
+    }
+    return $out
 }
 
 # ---------- 消耗速度与预计用完 ----------
@@ -370,6 +447,7 @@ $script:Metrics  = $null
 $script:Trend    = @()
 $script:Consumed = 0
 $script:Model    = ''
+$script:LastRate = 0.0
 
 function Get-ModelParts([string]$m) {
     $name = ''; $level = ''
@@ -384,6 +462,76 @@ function Get-ModelParts([string]$m) {
     return @{ Name = $name; Level = $level; Short = $short }
 }
 
+# ---------- 版本 / 更新检查 / 低额度提醒 ----------
+$script:Version    = '1.1.0'
+$script:UpdateNote = ''
+$script:UpdateAt   = [DateTime]::MinValue
+$script:AlertLevel = ''
+$script:AlertDate  = ''
+$script:Week       = @()
+
+function Get-TextSha1([string]$text) {
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($text -replace "`r", ''))
+    return [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '')
+}
+
+function Test-RemoteUpdate {
+    if (((Get-Date) - $script:UpdateAt).TotalHours -lt 1) { return }
+    $script:UpdateAt = Get-Date
+    try {
+        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/widget.js' -UseBasicParsing -TimeoutSec 8
+        $local = [IO.File]::ReadAllText($widgetF)
+        if ((Get-TextSha1 $raw.Content) -ne (Get-TextSha1 $local)) {
+            if ($script:UpdateNote -ne '有新版') { Write-Log 'update available (remote widget.js differs)' }
+            $script:UpdateNote = '有新版'
+        } else {
+            $script:UpdateNote = ''
+        }
+    } catch {
+        # 离线/限流时静默，下一次再试
+    }
+}
+
+function Show-AlertBalloon([string]$text) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $ni = New-Object System.Windows.Forms.NotifyIcon
+        $ni.Icon = [System.Drawing.SystemIcons]::Warning
+        $ni.Visible = $true
+        $ni.BalloonTipTitle = '豆包额度提醒'
+        $ni.BalloonTipText = $text
+        $ni.ShowBalloonTip(6000)
+        Start-Sleep -Milliseconds 700
+        $ni.Dispose()
+    } catch { }
+}
+
+function Update-Alert($m) {
+    $pct = [double]$m.RemainPct
+    $text = ''
+    $level = ''
+    if ($pct -le 10) {
+        $level = 'critical'
+        $text = ('额度告急：仅剩 {0}%（约 {1} 点），预计 {2}' -f $pct, $m.RemainStr, (Format-Duration ($m.RemainNum / [math]::Max($script:LastRate, 0.001))))
+    } elseif ($pct -le $script:AlertPct) {
+        $level = 'warn'
+        $text = ('额度偏低：剩余 {0}%（约 {1} 点）' -f $pct, $m.RemainStr)
+    }
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    if ($level -and ($script:AlertLevel -ne $level -or $script:AlertDate -ne $today)) {
+        Write-Log ('alert -> ' + $level + ' ' + $text)
+        Show-AlertBalloon $text
+    }
+    $script:AlertLevel = $level
+    $script:AlertDate  = $today
+
+    if ($level) { return @{ text = $text; level = $level } }
+    return $null
+}
+
 function New-DataJson {
     if (-not $script:Metrics) { return $null }
     $m = $script:Metrics
@@ -392,40 +540,49 @@ function New-DataJson {
     $modelText = if ($mp.Name) { $mp.Name + $(if ($mp.Level) { ' · ' + $mp.Level } else { '' }) } else { '未识别' }
 
     $usage = Get-UsageRate
+    $script:LastRate = $usage.Rate
     $rateText = if ($usage.Rate -gt 0) {
         ('{0:0.0} 点/小时{1}' -f $usage.Rate, $(if ($usage.Basis -eq 'today') { '（近期均值）' } else { '（近 6 小时）' }))
     } else { '暂无消耗' }
     $etaText  = if ($usage.Rate -gt 0 -and $m.RemainNum -gt 0) { Format-Duration ($m.RemainNum / $usage.Rate) } else { '—' }
 
-    $rows = @(
-        , @('当前模型', $modelText)
-        , @('可用额度', $m.RemainStr)
-        , @('已用 / 总额', ('{0:0} / {1:0}   {2}%' -f $m.Used, $m.Total, $m.Pct))
-        , @('今日新增消耗', ('+{0:0}' -f $script:Consumed))
-        , @('消耗速度', $rateText)
-        , @('预计用完', $etaText)
-        , @('最近窗口归零', $m.Expiry)
-        , @('额度档位', ('{0} 档' -f $m.Count))
-        , @('数据更新', (Get-Date -Format 'HH:mm'))
-    )
+    $rows = New-Object System.Collections.ArrayList
+    $null = $rows.Add(@('当前模型', $modelText))
+    $null = $rows.Add(@('可用额度', $m.RemainStr))
+    $null = $rows.Add(@('已用 / 总额', ('{0:0} / {1:0} · {2}%' -f $m.Used, $m.Total, $m.Pct)))
+    $null = $rows.Add(@('今日新增消耗', ('+{0:0}' -f $script:Consumed)))
+    $null = $rows.Add(@('消耗速度', $rateText))
+    $null = $rows.Add(@('预计用完', $etaText))
+    foreach ($w in @($m.Windows)) {
+        if (-not $w) { continue }
+        $null = $rows.Add(@($w.Label, ('余 {0}%  {1}' -f $w.Pct, $w.Reset)))
+    }
+    $null = $rows.Add(@('最近窗口归零', $m.Expiry))
+    $ver = 'v' + $script:Version + $(if ($script:UpdateNote) { ' · ' + $script:UpdateNote } else { '' }) + ' · ' + (Get-Date -Format 'HH:mm')
+    $null = $rows.Add(@('版本', $ver))
 
-    # 圆环：满圈 = 总积分，亮弧 = 剩余占比；圈内写剩余积分（短数字用原值，长了退回紧凑写法）
+    # 圆环：满圈 = 总积分，亮弧 = 剩余占比；圈内写剩余积分
     $centerText = if (([string]$m.RemainStr).Length -le 5) { [string]$m.RemainStr } else { $badge }
 
     $ringList = @($m.Rings)
     $gaugeRings = @()
     for ($i = 0; $i -lt $ringList.Count; $i++) {
         $color = $null
-        if ($ringList.Count -gt 1) { $color = if ($i -eq 0) { '#f5c451' } else { '#7fd8ff' } }
+        if ($ringList.Count -gt 1) {
+            if ([string]$ringList[$i].Type -eq 'H5') { $color = '#7fd8ff' } else { $color = '#f5c451' }
+        }
         $gaugeRings += [pscustomobject]@{ pct = [double]$ringList[$i].Pct; color = $color }
     }
 
     $data = @{
         badge   = $badge
         title   = '豆包额度'
-        rows    = $rows
+        rows    = @($rows)
         trend   = @($script:Trend)
+        week    = @($script:Week)
+        alert   = (Update-Alert $m)
         openUrl = $OpenUrl
+        scale   = [double]$script:Scale
         gauge   = @{ center = $centerText; rings = $gaugeRings }
     }
     if ($script:Pos) {
@@ -459,10 +616,12 @@ while ($true) {
             $m = Get-QuotaMetrics $list
             Add-Sample $m.Used $m.RemainNum
             $tr = Get-TodayTrend
+            Test-RemoteUpdate
 
             $script:Metrics  = $m
             $script:Trend    = @($tr.Points)
             $script:Consumed = $tr.Consumed
+            $script:Week     = @(Get-WeekBuckets)
 
             $json = New-DataJson
             if ($json -and $json -ne $script:DataJson) {
@@ -470,7 +629,7 @@ while ($true) {
                 try {
                     [IO.File]::WriteAllText($dataF, ($json | ConvertFrom-Json | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
                 } catch { }
-                Write-Log ('quota -> ' + $m.Badge + '  used=' + $m.Used + '/' + $m.Total + '  今日+' + $tr.Consumed + '  trend=' + @($tr.Points).Count + 'pt  model=' + $script:Model)
+                Write-Log ('quota -> ' + $m.Badge + '  used=' + $m.Used + '/' + $m.Total + '  今日+' + $tr.Consumed + '  trend=' + @($tr.Points).Count + 'pt  win=' + @($m.Windows).Count + '  model=' + $script:Model)
             }
             $script:DataAt = Get-Date
         } catch {

@@ -1,3 +1,5 @@
 {
-  "aid": "在这里填你的 aid"
+  "aid": "",
+  "scale": 1,
+  "alert_pct": 20
 }
