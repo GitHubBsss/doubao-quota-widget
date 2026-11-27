@@ -389,7 +389,7 @@ function dbxWidget(data) {
 
   var stat = {
     lastLen: -1, growAt: 0, startAt: 0, startLen: 0, streaming: false,
-    thinkStart: 0, thinkSec: 0, turns: [], pendingAt: 0, firstMs: 0, rowCount: 0
+    thinkStart: 0, thinkSec: 0, turns: []
   };
 
   function findList() {
@@ -470,20 +470,6 @@ function dbxWidget(data) {
     var tok = Math.round(chars / 1.55);
     var lastTurn = stat.turns.length ? stat.turns[stat.turns.length - 1] : null;
 
-    // 首字延迟兜底：从「用户消息出现」到「助手开始出字」
-    var nowMs = Date.now();
-    if (rows.length > stat.rowCount) {
-      var lastRow = rows[rows.length - 1];
-      if (String(lastRow.className).indexOf('justify-end') >= 0) {
-        stat.pendingAt = nowMs;
-        stat.firstMs = 0;
-      }
-    }
-    stat.rowCount = rows.length;
-    if (lastAssistant && lastLen > 0 && stat.pendingAt && !stat.firstMs) {
-      stat.firstMs = nowMs - stat.pendingAt;
-    }
-
     var speedText = '—';
     if (stat.streaming) {
       speedText = '生成中…';
@@ -498,7 +484,6 @@ function dbxWidget(data) {
       }
     }
 
-    var firstText = stat.firstMs ? (stat.firstMs + ' ms') : '—';
     var tokText = '—';
     if (lastTurn) {
       tokText = '≈' + fmtK(Math.round(lastTurn.c / 1.55)) + ' tok';
@@ -507,7 +492,6 @@ function dbxWidget(data) {
     var liveRows = [
       ['会话上下文', msgs + ' 条 · ' + fmtK(chars) + ' 字 ≈ ' + fmtK(tok) + ' tok'],
       ['本轮输出', speedText],
-      ['首字延迟', firstText],
       ['本次 Token', tokText]
     ];
 
