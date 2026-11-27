@@ -40,6 +40,14 @@ function dbxWidget(data) {
   } else {
     try { POS = JSON.parse(localStorage.getItem('dbxBallPos') || 'null'); } catch (e) { POS = null; }
   }
+  // 换分辨率/多显示器后旧坐标可能落在屏幕外，注入时先收敛一次
+  if (POS) {
+    var MAXL = Math.max(8, window.innerWidth - 64), MAXT = Math.max(8, window.innerHeight - 64);
+    POS = {
+      left: Math.min(Math.max(8, Number(POS.left) || 0), MAXL),
+      top: Math.min(Math.max(8, Number(POS.top) || 0), MAXT)
+    };
+  }
 
   var root = document.createElement('div');
   root.id = 'dbx-root';
@@ -94,6 +102,27 @@ function dbxWidget(data) {
     'opacity:0', 'pointer-events:none', 'transition:opacity .2s'
   ].join(';');
   ball.appendChild(pulse);
+
+  // 状态点：暂停=灰，刷新失败=红；正常隐藏
+  var statusDot = document.createElement('div');
+  statusDot.style.cssText = 'position:absolute;right:3px;top:3px;width:7px;height:7px;border-radius:50%;z-index:3;display:none;background:#8b8b94;box-shadow:0 0 0 1px rgba(0,0,0,.25);pointer-events:none';
+  ball.appendChild(statusDot);
+  var widgetPaused = !!data.paused;
+  var widgetStale = !!data.stale;
+  function applyStatusDot() {
+    if (widgetPaused) {
+      statusDot.style.display = 'block';
+      statusDot.style.background = '#8b8b94';
+      statusDot.title = '已暂停刷新';
+    } else if (widgetStale) {
+      statusDot.style.display = 'block';
+      statusDot.style.background = '#ff6b5b';
+      statusDot.title = '额度刷新失败';
+    } else {
+      statusDot.style.display = 'none';
+    }
+  }
+  applyStatusDot();
   var pulseTimer = setInterval(function () {
     if (pulse.style.opacity !== '1') return;
     var t = Date.now() % 1600;
@@ -353,130 +382,6 @@ function dbxWidget(data) {
 
   renderWeek(data.week);
 
-  /* ---------- 生成指标：劫持 fetch 读回复流（首字延迟 / 真实 usage） ---------- */
-  var NET = { list: [] };
-  window.__dbxNet = NET;
-
-  (function patchFetch() {
-    if (window.__dbxFetchPatched) return;
-    window.__dbxFetchPatched = true;
-    var orig = window.fetch;
-    if (typeof orig !== 'function') return;
-
-    window.fetch = function (input, init) {
-      var url = '';
-      try { url = (typeof input === 'string') ? input : ((input && input.url) || ''); } catch (e) { }
-      var p = orig.apply(this, arguments);
-      if (!/chat|completion|conversation|generate|sse|stream|message/i.test(url)) return p;
-
-      var start = performance.now();
-      return p.then(function (res) {
-        try {
-          if (!res || !res.body || !res.clone) return res;
-          var ct = (res.headers && res.headers.get('content-type')) || '';
-          if (!/event-stream|stream|text\/plain|json/i.test(ct)) return res;
-
-          var entry = { url: url, start: start, first: 0, end: 0, bytes: 0, usage: null };
-          NET.list.push(entry);
-          if (NET.list.length > 20) NET.list.shift();
-
-          var clone = res.clone();
-          (function readStream() {
-            var reader = clone.body.getReader();
-            var dec = new TextDecoder('utf-8');
-            var buf = '';
-            function pump() {
-              return reader.read().then(function (r) {
-                if (r.done) {
-                  entry.end = performance.now();
-                  parseUsage(buf, entry);
-                  return;
-                }
-                if (!entry.first) entry.first = performance.now() - start;
-                var txt = dec.decode(r.value, { stream: true });
-                entry.bytes += txt.length;
-                buf += txt;
-                if (buf.length > 12000) buf = buf.slice(-8000);
-                return pump();
-              }).catch(function () { });
-            }
-            pump();
-          })();
-        } catch (e) { }
-        return res;
-      });
-    };
-  })();
-
-  function parseUsage(buf, entry) {
-    try {
-      var m = buf.match(/"usage"\s*:\s*\{[^}]{0,600}\}/g);
-      if (!m) return;
-      var last = m[m.length - 1];
-      function num(k) {
-        var r = new RegExp('"' + k + '"\\s*:\\s*(\\d+)');
-        var x = last.match(r);
-        return x ? parseInt(x[1], 10) : 0;
-      }
-      entry.usage = {
-        prompt: num('prompt_tokens'),
-        completion: num('completion_tokens'),
-        cached: num('cached_tokens') || num('cache_read_input_tokens')
-      };
-      if (!entry.usage.prompt && !entry.usage.completion) entry.usage = null;
-    } catch (e) { }
-  }
-
-  /* XHR 也采样（桌面端不少接口走 XMLHttpRequest） */
-  (function patchXhr() {
-    if (window.__dbxXhrPatched) return;
-    window.__dbxXhrPatched = true;
-    var OX = window.XMLHttpRequest;
-    if (!OX) return;
-    var open = OX.prototype.open;
-    var send = OX.prototype.send;
-    OX.prototype.open = function (m, u) {
-      try { this.__dbxUrl = String(u); this.__dbxStart = performance.now(); } catch (e) { }
-      return open.apply(this, arguments);
-    };
-    OX.prototype.send = function () {
-      var xhr = this;
-      try {
-        if (/chat|message|completion|conversation|generate|queue|sse|stream/i.test(xhr.__dbxUrl || '')) {
-          var e = { url: xhr.__dbxUrl, start: xhr.__dbxStart || performance.now(), first: 0, end: 0, bytes: 0, usage: null, buf: '', kind: 'xhr' };
-          NET.list.push(e);
-          if (NET.list.length > 40) NET.list.shift();
-          var grab = function (done) {
-            try {
-              if (!e.first) e.first = performance.now() - e.start;
-              var t = '';
-              if (xhr.responseType === '' || xhr.responseType === 'text') t = xhr.responseText || '';
-              else if (xhr.responseType === 'json' && xhr.response) t = JSON.stringify(xhr.response);
-              if (t) {
-                e.bytes = t.length;
-                e.buf = t.length > 14000 ? t.slice(-10000) : t;
-                parseUsage(e.buf, e);
-              }
-              if (done) e.end = performance.now();
-            } catch (x) { }
-          };
-          xhr.addEventListener('progress', function () { grab(false); });
-          xhr.addEventListener('load', function () { grab(true); });
-        }
-      } catch (x) { }
-      return send.apply(this, arguments);
-    };
-  })();
-
-  function latestNet(maxAgeMs) {
-    var now = performance.now();
-    for (var i = NET.list.length - 1; i >= 0; i--) {
-      var e = NET.list[i];
-      if (e.first > 0 && now - e.start < (maxAgeMs || 5 * 60 * 1000)) return e;
-    }
-    return null;
-  }
-
   /* ---------- 会话统计（读聊天 DOM，纯估算） ---------- */
   var liveBox = document.createElement('div');
   liveBox.style.cssText = 'margin-top:8px;padding-top:8px;border-top:1px solid ' + P.line + ';display:none';
@@ -564,7 +469,6 @@ function dbxWidget(data) {
 
     var tok = Math.round(chars / 1.55);
     var lastTurn = stat.turns.length ? stat.turns[stat.turns.length - 1] : null;
-    var net = latestNet(3 * 60 * 1000);
 
     // 首字延迟兜底：从「用户消息出现」到「助手开始出字」
     var nowMs = Date.now();
@@ -594,14 +498,10 @@ function dbxWidget(data) {
       }
     }
 
-    var firstText = (net && net.first) ? (Math.round(net.first) + ' ms') : (stat.firstMs ? (stat.firstMs + ' ms') : '—');
+    var firstText = stat.firstMs ? (stat.firstMs + ' ms') : '—';
     var tokText = '—';
     if (lastTurn) {
-      if (net && net.usage && net.usage.completion > 0) {
-        tokText = fmtK(net.usage.completion) + ' tok（真实）';
-      } else {
-        tokText = '≈' + fmtK(Math.round(lastTurn.c / 1.55)) + ' tok';
-      }
+      tokText = '≈' + fmtK(Math.round(lastTurn.c / 1.55)) + ' tok';
     }
 
     var liveRows = [
@@ -863,7 +763,13 @@ function dbxWidget(data) {
     if (d.week) renderWeek(d.week);
     if (typeof d.paused !== 'undefined') {
       paused = !!d.paused;
+      widgetPaused = paused;
       if (menuPauseItem) menuPauseItem.textContent = paused ? '恢复刷新' : '暂停刷新';
+      applyStatusDot();
+    }
+    if (typeof d.stale !== 'undefined') {
+      widgetStale = !!d.stale;
+      applyStatusDot();
     }
     if (d.alert && d.alert.text) {
       banner.style.display = 'block';

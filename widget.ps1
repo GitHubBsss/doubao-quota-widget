@@ -54,14 +54,41 @@ function Stop-Daemon {
 }
 
 function Start-Daemon {
-    if (-not (Test-Path -LiteralPath $vbs)) { Write-Host '缺少 start-daemon.vbs，无法启动'; return }
+    if (-not (Test-Path -LiteralPath $vbs)) { Write-Host '缺少 start-daemon.vbs，无法启动'; return $false }
     Start-Process -FilePath "$env:SystemRoot\System32\wscript.exe" -ArgumentList $vbs
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 300
         $p = Get-DaemonPid
-        if ($p) { Write-Host "守护进程已启动 (pid=$p)"; return }
+        if ($p) { Write-Host "守护进程已启动 (pid=$p)"; return $true }
     }
     Write-Host '启动超时，请查看 daemon.log'
+    return $false
+}
+
+function Test-StagedUpdate([string]$dir) {
+    $js = Join-Path $dir 'widget.js'
+    $daemon = Join-Path $dir 'doubao-widget-daemon.ps1'
+    $cli = Join-Path $dir 'widget.ps1'
+    if (-not (Test-Path -LiteralPath $js) -or -not (Test-Path -LiteralPath $daemon)) {
+        Write-Host '更新包缺少 widget.js / doubao-widget-daemon.ps1'
+        return $false
+    }
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($node) {
+        & $node.Source --check $js 2>$null
+        if ($LASTEXITCODE -ne 0) { Write-Host 'widget.js 语法校验失败'; return $false }
+    }
+    foreach ($ps in @($daemon, $cli)) {
+        if (-not (Test-Path -LiteralPath $ps)) { continue }
+        $txt = [IO.File]::ReadAllText($ps)
+        $errs = $null
+        $null = [System.Management.Automation.PSParser]::Tokenize($txt, [ref]$errs)
+        if ($errs -and $errs.Count -gt 0) {
+            Write-Host ('脚本语法校验失败: ' + (Split-Path $ps -Leaf))
+            return $false
+        }
+    }
+    return $true
 }
 
 switch ($Action.Trim().ToLower()) {
@@ -121,24 +148,39 @@ switch ($Action.Trim().ToLower()) {
     }
     'restart' {
         Stop-Daemon
-        Start-Daemon
+        $null = Start-Daemon
     }
     'update' {
         Write-Host '从 GitHub 拉取最新版本...'
         $url = 'https://codeload.github.com/GitHubBsss/doubao-quota-widget/zip/refs/heads/main'
-        $tmpZip = Join-Path $env:TEMP ('dbx-update-' + (Get-Date -Format 'yyyyMMddHHmmss') + '.zip')
+        $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+        $tmpZip = Join-Path $env:TEMP ('dbx-update-' + $stamp + '.zip')
+        $tmpDir = Join-Path $env:TEMP ('dbx-update-' + $stamp)
         try {
             Invoke-WebRequest -Uri $url -OutFile $tmpZip -UseBasicParsing -TimeoutSec 60
         } catch {
             Write-Host ('下载失败: ' + $_.Exception.Message)
             break
         }
-        $tmpDir = Join-Path $env:TEMP ('dbx-update-' + (Get-Date -Format 'yyyyMMddHHmmss'))
         Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpDir -Force
         $src = Get-ChildItem -LiteralPath $tmpDir -Directory | Select-Object -First 1
         if (-not $src) { Write-Host '压缩包结构异常'; break }
 
-        $files = @('widget.js', 'doubao-widget-daemon.ps1', 'start-daemon.vbs', 'install.ps1', 'install.cmd', 'uninstall.ps1', 'uninstall.cmd', 'README.md', 'config.example.json')
+        # 先在临时目录校验，通过后再动现有文件
+        if (-not (Test-StagedUpdate $src.FullName)) {
+            Write-Host '更新包校验失败，已保留当前版本'
+            Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+            break
+        }
+
+        $files = @('widget.js', 'doubao-widget-daemon.ps1', 'widget.ps1', 'start-daemon.vbs', 'install.ps1', 'install.cmd', 'uninstall.ps1', 'uninstall.cmd', 'README.md', 'config.example.json', 'version.json')
+        $backupDir = Join-Path $here ('backup-' + $stamp)
+        New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
+        foreach ($f in $files) {
+            $cur = Join-Path $here $f
+            if (Test-Path -LiteralPath $cur) { Copy-Item -LiteralPath $cur -Destination (Join-Path $backupDir $f) -Force }
+        }
         foreach ($f in $files) {
             $from = Join-Path $src.FullName $f
             if (Test-Path -LiteralPath $from) {
@@ -148,8 +190,19 @@ switch ($Action.Trim().ToLower()) {
         }
         Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+
         Stop-Daemon
-        Start-Daemon
+        $ok = Start-Daemon
+        if (-not $ok) {
+            Write-Host '新版本启动失败，正在回滚...'
+            foreach ($f in $files) {
+                $bak = Join-Path $backupDir $f
+                if (Test-Path -LiteralPath $bak) { Copy-Item -LiteralPath $bak -Destination (Join-Path $here $f) -Force }
+            }
+            $null = Start-Daemon
+            Write-Host ('已回滚，备份在 ' + $backupDir)
+            break
+        }
         Write-Host '更新完成'
     }
     'quit' {

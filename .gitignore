@@ -1,4 +1,4 @@
-# 运行时数据与本地配置
+﻿# 运行时数据与本地配置
 config.json
 data.json
 quota.json
@@ -15,6 +15,8 @@ command.txt
 daily-usage.json
 quota-history.csv
 dashboard.html
+backup-*/
+*.bak
 weekly-report.md
 
 # 截图与临时产物

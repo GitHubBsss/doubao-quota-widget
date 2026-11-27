@@ -25,6 +25,10 @@ function Find-DoubaoExe {
         (Join-Path ([Environment]::GetFolderPath('Desktop')) '豆包.lnk'),
         (Join-Path ([Environment]::GetFolderPath('Programs')) '豆包.lnk')
     )
+    $pins = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    if (Test-Path -LiteralPath $pins) {
+        $links += @(Get-ChildItem -LiteralPath $pins -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -match '豆包|Doubao' } | ForEach-Object { $_.FullName })
+    }
     foreach ($l in $links) {
         if (Test-Path -LiteralPath $l) {
             try {
@@ -68,15 +72,22 @@ function Set-DoubaoShortcut([string]$exe) {
         (Join-Path ([Environment]::GetFolderPath('Desktop')) '豆包.lnk'),
         (Join-Path ([Environment]::GetFolderPath('Programs')) '豆包.lnk')
     )
+    $pins = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    if (Test-Path -LiteralPath $pins) {
+        $links += @(Get-ChildItem -LiteralPath $pins -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -match '豆包|Doubao' } | ForEach-Object { $_.FullName })
+    }
     $changed = @()
-    foreach ($l in $links) {
+    foreach ($l in @($links | Select-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $l)) { continue }
         try {
             $sc = $sh.CreateShortcut($l)
+            if ([string]$sc.TargetPath -and ([string]$sc.TargetPath -notmatch 'Doubao\.exe')) { continue }
             $bak = $l + '.bak'
             if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $l -Destination $bak }
             $args = [string]$sc.Arguments
-            if ($args -notmatch '--remote-debugging-port') {
+            if ($args -match '--remote-debugging-port=\d+') {
+                $args = $args -replace '--remote-debugging-port=\d+', ('--remote-debugging-port=' + $port)
+            } elseif ($args -notmatch '--remote-debugging-port') {
                 $args = ($args + ' --remote-debugging-port=' + $port).Trim()
             }
             $sc.TargetPath = $exe

@@ -38,10 +38,18 @@ function Write-Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
     try {
         if ((Test-Path -LiteralPath $logF) -and (Get-Item -LiteralPath $logF).Length -gt 1MB) {
+            Move-Item -LiteralPath $logF -Destination ($logF + '.old') -Force
             [IO.File]::WriteAllText($logF, '')
         }
         Add-Content -LiteralPath $logF -Value $line -Encoding utf8
     } catch { }
+}
+
+# 同目录临时文件 + 覆盖移动，避免读到写了一半的 JSON
+function Write-TextAtomic([string]$path, [string]$text, [bool]$bom = $false) {
+    $tmp = $path + '.tmp'
+    [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($bom)))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
 }
 
 # ---------- CDP 客户端 ----------
@@ -259,6 +267,15 @@ if (Test-Path -LiteralPath $historyF) {
         $script:History = @($h)
     } catch { $script:History = @() }
 }
+$script:HistorySavedAt = Get-Date
+
+function Save-History {
+    try {
+        $json = @($script:History) | ConvertTo-Json -Compress -Depth 4
+        Write-TextAtomic $historyF $json $false
+        $script:HistorySavedAt = Get-Date
+    } catch { }
+}
 
 function Add-Sample([double]$used, [double]$remain) {
     $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
@@ -266,10 +283,8 @@ function Add-Sample([double]$used, [double]$remain) {
     if ($script:History.Count -gt $MaxSamples) {
         $script:History = @($script:History | Select-Object -Last $MaxSamples)
     }
-    try {
-        $json = @($script:History) | ConvertTo-Json -Compress -Depth 4
-        [IO.File]::WriteAllText($historyF, $json, (New-Object Text.UTF8Encoding($false)))
-    } catch { }
+    # 每 10 分钟落一次 history；CSV 每采样都追加，重启最多丢 10 分钟趋势点
+    if (((Get-Date) - $script:HistorySavedAt).TotalSeconds -ge 600) { Save-History }
     Add-DailyDelta $used
 }
 
@@ -371,21 +386,23 @@ if (Test-Path -LiteralPath $dailyF) {
 function Save-Daily {
     try {
         $obj = @{ days = $script:Daily; last = $script:DailyLast }
-        [IO.File]::WriteAllText($dailyF, ($obj | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding($false)))
+        Write-TextAtomic $dailyF ($obj | ConvertTo-Json -Depth 4 -Compress) $false
     } catch { }
 }
 
 function Add-DailyDelta([double]$used) {
     $day = (Get-Date).ToString('yyyy-MM-dd')
+    $changed = $false
     if ($null -ne $script:DailyLast) {
         $d = $used - [double]$script:DailyLast
         if ($d -gt 0) {
             if (-not $script:Daily.ContainsKey($day)) { $script:Daily[$day] = 0.0 }
             $script:Daily[$day] = [double]$script:Daily[$day] + $d
+            $changed = $true
         }
     }
     $script:DailyLast = $used
-    Save-Daily
+    if ($changed -or -not (Test-Path -LiteralPath $dailyF)) { Save-Daily }
 }
 
 function Initialize-Daily {
@@ -419,8 +436,8 @@ function Get-UsageStats {
     $t30 = 0.0; foreach ($x in $d30) { $t30 += [double]$x.v }
     $t7  = 0.0; foreach ($x in $d7)  { $t7  += [double]$x.v }
 
-    $active = @($script:Daily.Keys | Where-Object { $_ -ge (Get-Date).AddDays(-30).ToString('yyyy-MM-dd') }).Count
-    $avg = if ($active -gt 0) { $t30 / $active } else { 0 }
+    # 按自然日 30 天摊平，避免只有一两天数据时把日均算得虚高
+    $avg = $t30 / 30.0
 
     $peak = $d30 | Sort-Object v -Descending | Select-Object -First 1
 
@@ -453,52 +470,119 @@ function Get-UsageStats {
 }
 
 # ---------- 导出 CSV（Excel 可直接打开：时间 / 已用 / 剩余 / 当日累计） ----------
+function Initialize-Csv {
+    $script:CsvLastT = [int64]0
+    $script:CsvDay = ''
+    $script:CsvPrevU = $null
+    $script:CsvCum = 0.0
+    if (Test-Path -LiteralPath $csvF) {
+        try {
+            $line = (Get-Content -LiteralPath $csvF -Tail 1 -Encoding utf8).Trim()
+            if ($line -and -not $line.StartsWith('时间')) {
+                $p = $line.Split(',')
+                if ($p.Count -ge 4) {
+                    $dt = [datetime]::ParseExact($p[0], 'yyyy-MM-dd HH:mm:ss', $null)
+                    # CSV 时间只到秒，+999ms 避免重启后同一秒的采样重复追加
+                    $script:CsvLastT = ([DateTimeOffset]$dt).ToUnixTimeMilliseconds() + 999
+                    $script:CsvDay = $p[0].Substring(0, 10)
+                    $script:CsvPrevU = [double]$p[1]
+                    $script:CsvCum = [double]$p[3]
+                }
+            }
+        } catch { }
+        if (-not $script:CsvDay -and (Get-Item -LiteralPath $csvF).Length -eq 0) {
+            [IO.File]::WriteAllText($csvF, "时间,已用,剩余,当日累计`r`n", (New-Object Text.UTF8Encoding($true)))
+        }
+    } else {
+        [IO.File]::WriteAllText($csvF, "时间,已用,剩余,当日累计`r`n", (New-Object Text.UTF8Encoding($true)))
+    }
+    $script:CsvReady = $true
+}
+
+# 追加式导出：只写 CSV 里还没有的采样，历史不再被 24 小时窗口截断
 function Export-HistoryCsv {
     try {
+        if (-not $script:CsvReady) { Initialize-Csv }
         $sb = New-Object System.Text.StringBuilder
-        $null = $sb.AppendLine('时间,已用,剩余,当日累计')
-        $day = ''
-        $prev = $null
-        $cum = 0.0
+        $lastT = [int64]$script:CsvLastT
         foreach ($s in $script:History) {
-            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.t).ToLocalTime()
-            $d = $dt.ToString('yyyy-MM-dd')
-            if ($d -ne $day) { $day = $d; $cum = 0.0; $prev = $null }
+            $t = [int64]$s.t
+            if ($t -le $lastT) { continue }
+            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($t).ToLocalTime()
+            $day = $dt.ToString('yyyy-MM-dd')
             $u = [double]$s.u
-            if ($null -eq $prev) { $prev = $u }
-            $delta = $u - $prev
-            if ($delta -gt 0) { $cum += $delta }
-            $prev = $u
-            $null = $sb.AppendLine(('{0},{1},{2},{3}' -f $dt.ToString('yyyy-MM-dd HH:mm:ss'), [int]$s.u, [int]$s.r, [int]$cum))
+            if ($day -ne $script:CsvDay) {
+                $script:CsvDay = $day
+                $script:CsvCum = 0.0
+                $script:CsvPrevU = $u
+            } else {
+                if ($null -ne $script:CsvPrevU) {
+                    $delta = $u - [double]$script:CsvPrevU
+                    if ($delta -gt 0) { $script:CsvCum += $delta }
+                }
+                $script:CsvPrevU = $u
+            }
+            $null = $sb.AppendLine(('{0},{1},{2},{3}' -f $dt.ToString('yyyy-MM-dd HH:mm:ss'), [int]$s.u, [int]$s.r, [int]$script:CsvCum))
+            $lastT = $t
         }
-        [IO.File]::WriteAllText($csvF, $sb.ToString(), (New-Object Text.UTF8Encoding($true)))
+        if ($sb.Length -gt 0) {
+            [IO.File]::AppendAllText($csvF, $sb.ToString(), (New-Object Text.UTF8Encoding($false)))
+        }
+        $script:CsvLastT = $lastT
     } catch { }
 }
 
 # ---------- 消耗速度与预计用完 ----------
 function Get-UsageRate {
-    # 优先用近 6 小时窗口的真实增量；采样跨度不足 2 小时时退回「今日累计 / 今日已过时长」，避免短样本把速度算爆
+    # 近 3 小时、按「有效燃烧段」算：间隔 >10 分钟的断档不计入分母，避免空闲把速度稀释
     $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
-    $startMs = $nowMs - 6 * 60 * 60 * 1000
+    $startMs = $nowMs - 3 * 60 * 60 * 1000
     $s = @($script:History | Where-Object { [int64]$_.t -ge $startMs })
 
     if ($s.Count -ge 2) {
         $burned = 0.0
+        $burnFirst = $null
+        $burnLast = $null
         $prevU = [double]$s[0].u
+        $prevT = [int64]$s[0].t
         foreach ($x in $s) {
-            $u = [double]$x.u
-            $d = $u - $prevU
-            if ($d -gt 0) { $burned += $d }
-            $prevU = $u
+            $t = [int64]$x.t
+            $gap = ($t - $prevT) / 60000.0
+            if ($gap -gt 10) { $prevU = [double]$x.u; $prevT = $t; continue }
+            if ($gap -ge 0.5) {
+                $d = [double]$x.u - $prevU
+                if ($d -gt 0) {
+                    $burned += $d
+                    if ($null -eq $burnFirst) { $burnFirst = $prevT }
+                    $burnLast = $t
+                }
+            }
+            $prevU = [double]$x.u
+            $prevT = $t
         }
-        $spanMs = [int64]$s[$s.Count - 1].t - [int64]$s[0].t
-        $hours = $spanMs / 3600000.0
-        if ($hours -ge 2 -and $burned -gt 0) {
-            return @{ Rate = $burned / $hours; Basis = '6h' }
+        if ($burned -gt 0 -and $null -ne $burnFirst) {
+            # 只按「有增量的时段」计时：空闲不进分母，跳变过密时按 30 分钟摊薄
+            $spanMin = ($burnLast - $burnFirst) / 60000.0
+            if ($spanMin -lt 30) { $spanMin = 30 }
+            return @{ Rate = ($burned / ($spanMin / 60.0)); Basis = '3h' }
         }
     }
 
-    # 退回今日口径
+    # 近 3 小时没有有效增量，退回 6 小时平均（保留「最近一直在用」的体感）
+    $s6 = @($script:History | Where-Object { [int64]$_.t -ge ($nowMs - 6 * 60 * 60 * 1000) })
+    if ($s6.Count -ge 2) {
+        $burned6 = 0.0
+        $prev6 = [double]$s6[0].u
+        foreach ($x in $s6) {
+            $d = [double]$x.u - $prev6
+            if ($d -gt 0) { $burned6 += $d }
+            $prev6 = [double]$x.u
+        }
+        $hours6 = ([int64]$s6[$s6.Count - 1].t - [int64]$s6[0].t) / 3600000.0
+        if ($hours6 -ge 2 -and $burned6 -gt 0) { return @{ Rate = $burned6 / $hours6; Basis = '6h' } }
+    }
+
+    # 采样不足时退回今日口径
     $now = Get-Date
     $midnightMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() - ($now - $now.Date).TotalMilliseconds
     $today = @($script:History | Where-Object { [int64]$_.t -ge [int64]$midnightMs })
@@ -521,6 +605,10 @@ function Format-Duration([double]$h) {
 # ---------- 状态 ----------
 $script:DataJson = $null
 $script:DataAt   = [DateTime]::MinValue
+$script:QuotaNext = [DateTime]::MinValue
+$script:FailCount = 0
+$script:Stale     = $false
+$script:LastOkAt  = $null
 if (Test-Path -LiteralPath $dataF) {
     try { $script:DataJson = (Get-Content -LiteralPath $dataF -Raw).Trim() } catch { }
 }
@@ -597,7 +685,7 @@ function Get-ModelParts([string]$m) {
 }
 
 # ---------- 版本 / 更新检查 / 低额度提醒 ----------
-$script:Version    = '1.2.0'
+$script:Version    = '1.3.0'
 $script:UpdateNote = ''
 $script:UpdateAt   = [DateTime]::MinValue
 $script:AlertLevel = ''
@@ -619,15 +707,14 @@ function Test-RemoteUpdate {
     if (((Get-Date) - $script:UpdateAt).TotalHours -lt 1) { return }
     $script:UpdateAt = Get-Date
     try {
-        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/doubao-widget-daemon.ps1' -UseBasicParsing -TimeoutSec 8
-        if ($raw.Content -match "Version\s*=\s*'([0-9.]+)'") {
-            $remote = $Matches[1]
-            if ([version]$remote -gt [version]$script:Version) {
-                if ($script:UpdateNote -ne ('新版 ' + $remote)) { Write-Log ('update available: ' + $remote) }
-                $script:UpdateNote = '新版 ' + $remote
-            } else {
-                $script:UpdateNote = ''
-            }
+        $raw = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/GitHubBsss/doubao-quota-widget/main/version.json' -UseBasicParsing -TimeoutSec 8
+        $v = $raw.Content | ConvertFrom-Json
+        $remote = [string]$v.version
+        if ($remote -and ([version]$remote -gt [version]$script:Version)) {
+            if ($script:UpdateNote -ne ('新版 ' + $remote)) { Write-Log ('update available: ' + $remote) }
+            $script:UpdateNote = '新版 ' + $remote
+        } else {
+            $script:UpdateNote = ''
         }
     } catch {
         # 离线/限流时静默，下一次再试
@@ -723,18 +810,24 @@ function New-DataJson {
 
     $usage = Get-UsageRate
     $script:LastRate = $usage.Rate
-    $rateText = if ($usage.Rate -gt 0) {
-        ('{0:0.0} 点/小时{1}' -f $usage.Rate, $(if ($usage.Basis -eq 'today') { '（近期均值）' } else { '（近 6 小时）' }))
-    } else { '暂无消耗' }
+    $basisText = switch ($usage.Basis) {
+        '3h' { '（近 3 小时）' }
+        '6h' { '（长窗口均值）' }
+        'today' { '（今日均值）' }
+        default { '' }
+    }
+    $rateText = if ($usage.Rate -gt 0) { ('{0:0.0} 点/小时{1}' -f $usage.Rate, $basisText) } else { '暂无消耗' }
     $etaText  = if ($usage.Rate -gt 0 -and $m.RemainNum -gt 0) { Format-Duration ($m.RemainNum / $usage.Rate) } else { '—' }
 
     $rows = New-Object System.Collections.ArrayList
+    if ($script:Paused) { $null = $rows.Add(@('状态', '已暂停刷新')) }
+    elseif ($script:Stale) { $null = $rows.Add(@('状态', ('刷新失败 ' + $script:FailCount + ' 次'))) }
     $null = $rows.Add(@('当前模型', $modelText))
     $null = $rows.Add(@('可用额度', $m.RemainStr))
     $null = $rows.Add(@('已用 / 总额', ('{0:0} / {1:0} · {2}%' -f $m.Used, $m.Total, $m.Pct)))
     $null = $rows.Add(@('今日新增消耗', ('+{0:0}' -f $script:Consumed)))
     if ($script:Stats) {
-        $null = $rows.Add(@('本周消耗', ('{0} 点' -f $script:Stats.Week7)))
+        $null = $rows.Add(@('近 7 天消耗', ('{0} 点' -f $script:Stats.Week7)))
         $null = $rows.Add(@('近 30 天日均', ('{0:0.0} 点/天' -f $script:Stats.Avg30)))
     }
     $null = $rows.Add(@('消耗速度', $rateText))
@@ -768,6 +861,8 @@ function New-DataJson {
         week    = @($script:Week)
         alert   = (Update-Alert $m)
         paused  = [bool]$script:Paused
+        stale   = [bool]$script:Stale
+        updatedAt = $(if ($script:LastOkAt) { $script:LastOkAt.ToString('o') } else { $null })
         ver     = [string]$script:Version
         openUrl = $OpenUrl
         scale   = [double]$script:Scale
@@ -813,7 +908,7 @@ function New-Dashboard {
         @('可用额度', $(if ($m) { $m.RemainStr } else { '—' })),
         @('已用 / 总额', $(if ($m) { ('{0:0} / {1:0} · {2}%' -f $m.Used, $m.Total, $m.Pct) } else { '—' })),
         @('今日消耗', ('+{0:0}' -f $script:Consumed)),
-        @('本周消耗', ('{0} 点' -f $st.Week7)),
+        @('近 7 天消耗', ('{0} 点' -f $st.Week7)),
         @('近 30 天日均', ('{0:0.0} 点/天' -f $st.Avg30)),
         @('最费时段', ('{0:00}:00 前后' -f $st.BusyHour))
     )
@@ -851,13 +946,13 @@ function New-Dashboard {
     }
     $null = $sb.AppendLine('</table></div></body></html>')
 
-    [IO.File]::WriteAllText($dashF, $sb.ToString(), (New-Object Text.UTF8Encoding($true)))
+    Write-TextAtomic $dashF $sb.ToString() $true
 
     # Markdown 周报
     $md = New-Object System.Text.StringBuilder
     $null = $md.AppendLine('# 豆包额度周报 · ' + (Get-Date -Format 'yyyy-MM-dd'))
     $null = $md.AppendLine('')
-    $null = $md.AppendLine('- 本周消耗：' + $st.Week7 + ' 点')
+    $null = $md.AppendLine('- 近 7 天消耗：' + $st.Week7 + ' 点')
     $null = $md.AppendLine('- 近 30 天日均：' + ('{0:0.0}' -f $st.Avg30) + ' 点/天')
     $null = $md.AppendLine('- 峰值日：' + $(if ($st.PeakDay) { $st.PeakDay + '（' + $st.PeakVal + ' 点）' } else { '—' }))
     $null = $md.AppendLine('- 最费时段：' + ('{0:00}:00' -f $st.BusyHour) + ' 前后')
@@ -869,7 +964,7 @@ function New-Dashboard {
     $null = $md.AppendLine('| 日期 | 消耗（点） |')
     $null = $md.AppendLine('| --- | --- |')
     foreach ($x in $st.Days30) { $null = $md.AppendLine('| ' + $x.d + ' | ' + $x.v + ' |') }
-    [IO.File]::WriteAllText($reportF, $md.ToString(), (New-Object Text.UTF8Encoding($true)))
+    Write-TextAtomic $reportF $md.ToString() $true
 
     return $dashF
 }
@@ -878,7 +973,7 @@ function New-Dashboard {
 function Invoke-DaemonCmd([string]$action) {
     switch ($action.Trim().ToLower()) {
         'refresh' {
-            $script:DataAt = [DateTime]::MinValue
+            $script:QuotaNext = [DateTime]::MinValue
             Write-Log 'cmd -> refresh'
         }
         'pause' {
@@ -889,7 +984,7 @@ function Invoke-DaemonCmd([string]$action) {
         'resume' {
             Remove-Item -LiteralPath $pauseF -Force -ErrorAction SilentlyContinue
             $script:Paused = $false
-            $script:DataAt = [DateTime]::MinValue
+            $script:QuotaNext = [DateTime]::MinValue
             Write-Log 'cmd -> resume'
         }
         'export' {
@@ -928,7 +1023,7 @@ function Invoke-DaemonCmd([string]$action) {
             $nj = New-DataJson
             if ($nj -and $nj -ne $script:DataJson) {
                 $script:DataJson = $nj
-                [IO.File]::WriteAllText($dataF, ($nj | ConvertFrom-Json | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+                Write-TextAtomic $dataF ($nj | ConvertFrom-Json | ConvertTo-Json -Depth 6) $false
             }
         } catch { }
     }
@@ -976,7 +1071,7 @@ while ($true) {
     }
 
     # ---- 刷新额度 ----
-    if (-not $script:Paused -and ((Get-Date) - $script:DataAt).TotalSeconds -ge $QuotaSec) {
+    if (-not $script:Paused -and (Get-Date) -ge $script:QuotaNext) {
         try {
             $m = Get-QuotaMetrics $list
             Add-Sample $m.Used $m.RemainNum
@@ -990,19 +1085,32 @@ while ($true) {
             $script:Stats    = Get-UsageStats
             Export-HistoryCsv
 
+            $script:FailCount = 0
+            $script:Stale = $false
+            $script:LastOkAt = Get-Date
             $json = New-DataJson
             if ($json -and $json -ne $script:DataJson) {
                 $script:DataJson = $json
                 try {
-                    [IO.File]::WriteAllText($dataF, ($json | ConvertFrom-Json | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+                    Write-TextAtomic $dataF ($json | ConvertFrom-Json | ConvertTo-Json -Depth 6) $false
                 } catch { }
                 Write-Log ('quota -> ' + $m.Badge + '  used=' + $m.Used + '/' + $m.Total + '  今日+' + $tr.Consumed + '  trend=' + @($tr.Points).Count + 'pt  win=' + @($m.Windows).Count + '  model=' + $script:Model)
             }
             $script:DataAt = Get-Date
+            $script:QuotaNext = (Get-Date).AddSeconds($QuotaSec)
         } catch {
-            if (((Get-Date) - $script:DataAt).TotalSeconds -ge ($QuotaSec * 2)) {
-                Write-Log ("quota error: " + $_.Exception.Message)
-            }
+            $script:FailCount++
+            if ($script:FailCount -ge 3) { $script:Stale = $true }
+            $backoff = [Math]::Min(300, $QuotaSec * $script:FailCount)
+            $script:QuotaNext = (Get-Date).AddSeconds($backoff)
+            Write-Log ("quota error (" + $script:FailCount + "): " + $_.Exception.Message + "  retry in " + $backoff + "s")
+            try {
+                $nj = New-DataJson
+                if ($nj -and $nj -ne $script:DataJson) {
+                    $script:DataJson = $nj
+                    Write-TextAtomic $dataF ($nj | ConvertFrom-Json | ConvertTo-Json -Depth 6) $false
+                }
+            } catch { }
         }
     }
 
@@ -1075,7 +1183,7 @@ while ($true) {
                     if (-not $script:Pos -or [int]$script:Pos.left -ne $pl -or [int]$script:Pos.top -ne $pt) {
                         $script:Pos = @{ left = $pl; top = $pt }
                         try {
-                            [IO.File]::WriteAllText($posF, (@{ left = $pl; top = $pt } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+                            Write-TextAtomic $posF (@{ left = $pl; top = $pt } | ConvertTo-Json -Compress) $false
                         } catch { }
                         Write-Log ('pos -> ' + $pl + ',' + $pt)
                         $nj2 = New-DataJson
@@ -1132,6 +1240,7 @@ while ($true) {
     Start-Sleep -Milliseconds $PollMs
 }
 
+try { Save-History } catch { }
 Write-Log 'daemon exit'
 foreach ($k in @($script:Sessions.Keys)) {
     try { $script:Sessions[$k].ws.Dispose() } catch { }

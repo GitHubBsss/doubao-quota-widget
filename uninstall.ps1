@@ -29,7 +29,11 @@ $links = @(
     (Join-Path ([Environment]::GetFolderPath('Desktop')) '豆包.lnk'),
     (Join-Path ([Environment]::GetFolderPath('Programs')) '豆包.lnk')
 )
-foreach ($l in $links) {
+$pins = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+if (Test-Path -LiteralPath $pins) {
+    $links += @(Get-ChildItem -LiteralPath $pins -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -match '豆包|Doubao' } | ForEach-Object { $_.FullName })
+}
+foreach ($l in @($links | Select-Object -Unique)) {
     $bak = $l + '.bak'
     if (Test-Path -LiteralPath $bak) {
         Copy-Item -LiteralPath $bak -Destination $l -Force
