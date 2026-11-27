@@ -9,6 +9,7 @@ $here        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $widgetF     = Join-Path $here 'widget.js'
 $dataF       = Join-Path $here 'data.json'
 $historyF    = Join-Path $here 'quota-history.json'
+$csvF        = Join-Path $here 'quota-history.csv'
 $logF        = Join-Path $here 'daemon.log'
 $lockF       = Join-Path $here 'daemon.lock'
 $posF        = Join-Path $here 'widget-pos.json'
@@ -341,6 +342,29 @@ function Get-WeekBuckets {
     return $out
 }
 
+# ---------- 导出 CSV（Excel 可直接打开：时间 / 已用 / 剩余 / 当日累计） ----------
+function Export-HistoryCsv {
+    try {
+        $sb = New-Object System.Text.StringBuilder
+        $null = $sb.AppendLine('时间,已用,剩余,当日累计')
+        $day = ''
+        $prev = $null
+        $cum = 0.0
+        foreach ($s in $script:History) {
+            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.t).ToLocalTime()
+            $d = $dt.ToString('yyyy-MM-dd')
+            if ($d -ne $day) { $day = $d; $cum = 0.0; $prev = $null }
+            $u = [double]$s.u
+            if ($null -eq $prev) { $prev = $u }
+            $delta = $u - $prev
+            if ($delta -gt 0) { $cum += $delta }
+            $prev = $u
+            $null = $sb.AppendLine(('{0},{1},{2},{3}' -f $dt.ToString('yyyy-MM-dd HH:mm:ss'), [int]$s.u, [int]$s.r, [int]$cum))
+        }
+        [IO.File]::WriteAllText($csvF, $sb.ToString(), (New-Object Text.UTF8Encoding($true)))
+    } catch { }
+}
+
 # ---------- 消耗速度与预计用完 ----------
 function Get-UsageRate {
     # 优先用近 6 小时窗口的真实增量；采样跨度不足 2 小时时退回「今日累计 / 今日已过时长」，避免短样本把速度算爆
@@ -622,6 +646,7 @@ while ($true) {
             $script:Trend    = @($tr.Points)
             $script:Consumed = $tr.Consumed
             $script:Week     = @(Get-WeekBuckets)
+            Export-HistoryCsv
 
             $json = New-DataJson
             if ($json -and $json -ne $script:DataJson) {
