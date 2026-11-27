@@ -707,10 +707,10 @@ function dbxWidget(data) {
     return it;
   }
 
-  var paused = false;
+  var paused = !!(data && data.paused);
 
   menuItem('刷新数据', function () { window.__dbxCmd = { action: 'refresh', at: Date.now() }; });
-  menuPauseItem = menuItem('暂停刷新', function () {
+  menuPauseItem = menuItem(paused ? '恢复刷新' : '暂停刷新', function () {
     paused = !paused;
     window.__dbxCmd = { action: paused ? 'pause' : 'resume', at: Date.now() };
     menuPauseItem.textContent = paused ? '恢复刷新' : '暂停刷新';
@@ -861,6 +861,10 @@ function dbxWidget(data) {
     if (d.rows) renderRows(d.rows);
     if (d.trend) renderTrend(d.trend);
     if (d.week) renderWeek(d.week);
+    if (typeof d.paused !== 'undefined') {
+      paused = !!d.paused;
+      if (menuPauseItem) menuPauseItem.textContent = paused ? '恢复刷新' : '暂停刷新';
+    }
     if (d.alert && d.alert.text) {
       banner.style.display = 'block';
       banner.textContent = d.alert.text;
